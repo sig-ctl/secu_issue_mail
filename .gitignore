@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+data/db/*.db
+data/db/*.pickle
+data/logs/
+*.log
+node_modules/
+.DS_Store
+venv/
+.venv/
