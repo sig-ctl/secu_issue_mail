@@ -14,13 +14,14 @@ from ..services.llm_service import OllamaLLMService
 from ..services.ip_service import IPIntelligenceService
 from ..services.gmail_service import GmailService
 
-router = APIRouter(prefix="/api/alerts", tags=["alerts"])
+router = APIRouter(prefix="/api/alerts", tags=["alerts"], redirect_slashes=False)
 
 analyzer = SecurityAnalyzerService()
 llm_service = OllamaLLMService()
 ip_service = IPIntelligenceService()
 
 
+@router.get("")
 @router.get("/")
 async def get_alerts(
     db: AsyncSession = Depends(get_db),
