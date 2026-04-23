@@ -92,171 +92,419 @@ async function api(path, method = 'GET', body = null) {
 async function renderDashboard() {
   const days = parseInt(document.getElementById('period-select')?.value || 7);
   const stats = await api(`/api/alerts/stats?days=${days}`);
-  
+
   if (stats.error) {
-    document.getElementById('page-content').innerHTML = 
+    document.getElementById('page-content').innerHTML =
       `<div class="loading" style="color:var(--critical)">⚠️ 데이터 로드 오류: ${stats.error}</div>`;
     return;
   }
-  
-  // 심각도별 통계
+
   const bySev = stats.by_severity || {};
   const total = stats.total || 0;
   const fpRate = total > 0 ? Math.round((stats.false_positives || 0) / total * 100) : 0;
-  
-  // 위험도 색상
-  const riskColors = {
-    critical: 'var(--critical)', high: 'var(--high)', 
-    medium: 'var(--medium)', low: 'var(--low)', unknown: 'var(--text-muted)'
-  };
-  
-  // 최근 알람 행 생성
+  const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+
+  // SVG 아이콘 생성 헬퍼
+  const ico = (d, color) =>
+    `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${d}</svg>`;
+
+  // 최근 알람 행
   const recentRows = (stats.recent_alerts || []).map(a => `
     <tr style="cursor:pointer" onclick="showAlertDetail(${a.id})">
-      <td>${formatDate(a.received_at)}</td>
+      <td style="white-space:nowrap;font-size:12px;">${formatDate(a.received_at)}</td>
       <td>${severityBadge(a.severity)}</td>
-      <td style="max-width:350px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escHtml(a.subject || '')}">
+      <td style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escHtml(a.subject || '')}">
         ${escHtml(a.subject || '')}
         ${a.is_false_positive ? '<span class="badge badge-fp" style="margin-left:4px;">오탐</span>' : ''}
         ${a.is_repeated ? '<span class="badge badge-rep" style="margin-left:4px;">반복</span>' : ''}
       </td>
-      <td>${(a.extracted_ips || []).slice(0,2).map(ip => 
+      <td>${(a.extracted_ips || []).slice(0, 2).map(ip =>
         `<span class="ip-chip" onclick="event.stopPropagation();lookupIP('${ip}')">${ip}</span>`
       ).join('')}</td>
-      <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-muted);font-size:12px;">
-        ${escHtml((a.llm_summary || '미분석'))}
+      <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-muted);font-size:12px;">
+        ${escHtml(a.llm_summary || '미분석')}
       </td>
     </tr>`).join('') || '<tr><td colspan="5" style="text-align:center;color:var(--text-muted);padding:30px;">해당 기간 알람 없음</td></tr>';
-  
+
   // 상위 IP 행
   const topIPRows = (stats.top_threat_ips || []).map(ip => `
     <tr style="cursor:pointer" onclick="lookupIP('${ip.ip}')">
       <td><span class="ip-chip">${ip.ip}</span></td>
       <td>${ip.country || '-'}</td>
-      <td style="color:var(--text-muted);font-size:12px;">${ip.isp || '-'}</td>
+      <td style="color:var(--text-muted);font-size:12px;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${ip.isp || '-'}</td>
       <td>
         <div class="threat-score">
-          <span style="color:${ip.threat_score > 70 ? 'var(--critical)' : ip.threat_score > 40 ? 'var(--high)' : 'var(--low)'};font-weight:bold;">${ip.threat_score || 0}</span>
-          <div class="threat-bar" style="width:80px;">
+          <span style="color:${ip.threat_score > 70 ? 'var(--critical)' : ip.threat_score > 40 ? 'var(--high)' : 'var(--low)'};font-weight:700;">${ip.threat_score || 0}</span>
+          <div class="threat-bar" style="width:70px;">
             <div class="threat-fill" style="width:${ip.threat_score || 0}%;background:${ip.threat_score > 70 ? 'var(--critical)' : ip.threat_score > 40 ? 'var(--high)' : 'var(--low)'}"></div>
           </div>
         </div>
       </td>
-      <td style="color:var(--accent-cyan);font-weight:bold;">${ip.alert_count || 0}</td>
+      <td style="color:var(--accent-cyan);font-weight:700;">${ip.alert_count || 0}</td>
     </tr>`).join('') || '<tr><td colspan="5" style="text-align:center;color:var(--text-muted);padding:20px;">탐지된 위협 IP 없음</td></tr>';
-  
-  // 알람 유형
+
+  // 알람 유형 Top5 (클릭 시 해당 유형 알람 모달)
+  const maxTypeCount = Math.max(...Object.values(stats.by_type || {1:1}));
   const typeItems = Object.entries(stats.by_type || {}).slice(0, 5).map(([type, count]) => `
-    <div style="margin-bottom:10px;">
-      <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
-        <span style="font-size:12px;color:var(--text-secondary);">${type.slice(0,40)}</span>
-        <span style="font-size:12px;font-weight:bold;color:var(--text-primary);">${count}</span>
+    <div style="margin-bottom:10px;cursor:pointer;padding:6px 8px;border-radius:7px;transition:background 0.18s;"
+         onclick="showAlertsByType('${escHtml(type)}', ${days})"
+         onmouseover="this.style.background='var(--bg-card-hover)'" onmouseout="this.style.background=''">
+      <div style="display:flex;justify-content:space-between;margin-bottom:5px;align-items:center;">
+        <span style="font-size:12px;color:var(--text-secondary);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escHtml(type.slice(0, 38))}</span>
+        <span style="font-size:13px;font-weight:700;color:var(--text-primary);margin-left:8px;">${count}</span>
       </div>
       <div class="progress-bar">
-        <div class="progress-fill" style="width:${Math.round(count/Math.max(total,1)*100)}%"></div>
+        <div class="progress-fill" style="width:${Math.round(count / Math.max(maxTypeCount, 1) * 100)}%"></div>
       </div>
-    </div>`).join('') || '<p style="color:var(--text-muted);font-size:13px;">분류된 유형 없음</p>';
-  
+    </div>`).join('') || '<p style="color:var(--text-muted);font-size:13px;text-align:center;padding:20px 0;">분류된 유형 없음</p>';
+
+  // 상관분석 섹션
+  const corrSection = _buildCorrDashboardSection();
+
   document.getElementById('page-content').innerHTML = `
-    <!-- 통계 카드 -->
+    <!-- 통계 카드 (클릭 → 해당 심각도 알람 모달) -->
     <div class="stats-grid">
-      <div class="stat-card total">
+      <div class="stat-card total" onclick="showAlertsBySeverity('all', ${days})" title="전체 알람 보기">
+        <div class="stat-card-icon">
+          ${ico('<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>', 'var(--accent-blue)')}
+        </div>
         <div class="stat-value">${total}</div>
         <div class="stat-label">전체 알람</div>
+        <div class="stat-hint">${ico('<polyline points="9 18 15 12 9 6"/>', 'var(--text-muted)')} 클릭하여 목록 보기</div>
       </div>
-      <div class="stat-card critical">
+      <div class="stat-card critical" onclick="showAlertsBySeverity('critical', ${days})" title="Critical 알람 보기">
+        <div class="stat-card-icon">
+          ${ico('<path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>', 'var(--critical)')}
+        </div>
         <div class="stat-value">${bySev.critical || 0}</div>
         <div class="stat-label">CRITICAL</div>
+        <div class="stat-hint">${ico('<polyline points="9 18 15 12 9 6"/>', 'var(--text-muted)')} 클릭하여 목록 보기</div>
       </div>
-      <div class="stat-card high">
+      <div class="stat-card high" onclick="showAlertsBySeverity('high', ${days})" title="High 알람 보기">
+        <div class="stat-card-icon">
+          ${ico('<circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>', 'var(--high)')}
+        </div>
         <div class="stat-value">${bySev.high || 0}</div>
         <div class="stat-label">HIGH</div>
+        <div class="stat-hint">${ico('<polyline points="9 18 15 12 9 6"/>', 'var(--text-muted)')} 클릭하여 목록 보기</div>
       </div>
-      <div class="stat-card medium">
+      <div class="stat-card medium" onclick="showAlertsBySeverity('medium', ${days})" title="Medium 알람 보기">
+        <div class="stat-card-icon">
+          ${ico('<circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>', 'var(--medium)')}
+        </div>
         <div class="stat-value">${bySev.medium || 0}</div>
         <div class="stat-label">MEDIUM</div>
+        <div class="stat-hint">${ico('<polyline points="9 18 15 12 9 6"/>', 'var(--text-muted)')} 클릭하여 목록 보기</div>
       </div>
-      <div class="stat-card low">
+      <div class="stat-card low" onclick="showAlertsBySeverity('low', ${days})" title="Low/Info 알람 보기">
+        <div class="stat-card-icon">
+          ${ico('<circle cx="12" cy="12" r="10"/><polyline points="12 8 12 12 14 14"/>', 'var(--low)')}
+        </div>
         <div class="stat-value">${(bySev.low || 0) + (bySev.info || 0)}</div>
-        <div class="stat-label">LOW/INFO</div>
+        <div class="stat-label">LOW / INFO</div>
+        <div class="stat-hint">${ico('<polyline points="9 18 15 12 9 6"/>', 'var(--text-muted)')} 클릭하여 목록 보기</div>
       </div>
-      <div class="stat-card fp">
+      <div class="stat-card fp" onclick="showAlertsByFilter('fp', ${days})" title="오탐 알람 보기">
+        <div class="stat-card-icon">
+          ${ico('<path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/>', '#c77dff')}
+        </div>
         <div class="stat-value">${stats.false_positives || 0}</div>
         <div class="stat-label">오탐 (${fpRate}%)</div>
+        <div class="stat-hint">${ico('<polyline points="9 18 15 12 9 6"/>', 'var(--text-muted)')} 클릭하여 목록 보기</div>
       </div>
-      <div class="stat-card repeated">
+      <div class="stat-card repeated" onclick="showAlertsByFilter('repeated', ${days})" title="반복 알람 보기">
+        <div class="stat-card-icon">
+          ${ico('<polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/>', 'var(--info)')}
+        </div>
         <div class="stat-value">${stats.repeated || 0}</div>
         <div class="stat-label">반복 알람</div>
+        <div class="stat-hint">${ico('<polyline points="9 18 15 12 9 6"/>', 'var(--text-muted)')} 클릭하여 목록 보기</div>
       </div>
     </div>
-    
+
     <div class="grid-2">
-      <!-- 차트 -->
+      <!-- 심각도 차트 -->
       <div class="card">
-        <div class="card-title">📈 심각도 분포</div>
+        <div class="card-title">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--accent-blue)" stroke-width="2"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
+          심각도 분포
+        </div>
         <div class="chart-container">
           <canvas id="severity-chart"></canvas>
         </div>
       </div>
-      
-      <!-- 알람 유형 -->
+
+      <!-- 알람 유형 Top5 (클릭 가능) -->
       <div class="card">
-        <div class="card-title">📋 알람 유형 Top 5</div>
+        <div class="card-title">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--accent-cyan)" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+          알람 유형 Top 5
+          <span style="margin-left:auto;font-size:10px;color:var(--text-muted);font-weight:400;">클릭하여 해당 알람 보기</span>
+        </div>
         ${typeItems}
       </div>
     </div>
-    
+
+    <!-- 상관분석 섹션 -->
+    ${corrSection}
+
     <!-- 최근 알람 -->
     <div class="card">
       <div class="card-title">
-        🚨 최근 알람 
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--critical)" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>
+        최근 알람
         <span style="margin-left:auto;">
-          <button class="btn btn-primary btn-sm" onclick="navigate('alerts')">전체 보기 →</button>
+          <button class="btn btn-primary btn-sm" onclick="navigate('alerts')">전체 보기</button>
         </span>
       </div>
       <div class="table-container">
         <table>
-          <thead>
-            <tr>
-              <th>수신시간</th><th>심각도</th><th>제목</th><th>IP</th><th>AI 요약</th>
-            </tr>
-          </thead>
+          <thead><tr><th>수신시간</th><th>심각도</th><th>제목</th><th>IP</th><th>AI 요약</th></tr></thead>
           <tbody>${recentRows}</tbody>
         </table>
       </div>
     </div>
-    
+
     <!-- 위협 IP -->
     <div class="card">
       <div class="card-title">
-        🌐 상위 위협 IP
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--accent-orange)" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/></svg>
+        상위 위협 IP
         <span style="margin-left:auto;">
-          <button class="btn btn-secondary btn-sm" onclick="navigate('ip-intel')">IP 인텔리전스 →</button>
+          <button class="btn btn-secondary btn-sm" onclick="navigate('ip-intel')">IP 인텔리전스</button>
         </span>
       </div>
       <div class="table-container">
         <table>
-          <thead>
-            <tr><th>IP 주소</th><th>국가</th><th>ISP</th><th>위협 점수</th><th>탐지 횟수</th></tr>
-          </thead>
+          <thead><tr><th>IP 주소</th><th>국가</th><th>ISP</th><th>위협 점수</th><th>탐지 횟수</th></tr></thead>
           <tbody>${topIPRows}</tbody>
         </table>
       </div>
     </div>
   `;
-  
+
   // 차트 렌더링
-  renderSeverityChart(bySev);
+  renderSeverityChart(bySev, isLight);
 }
 
-function renderSeverityChart(bySev) {
+// 대시보드용 상관분석 섹션 빌드
+function _buildCorrDashboardSection() {
+  const r = _corrStatus.lastResult;
+  const isRunning = _corrStatus.running;
+
+  if (isRunning) {
+    return `
+    <div class="card" id="dash-corr-card">
+      <div class="card-title">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--accent-cyan)" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/></svg>
+        상관분석
+        <span style="margin-left:auto;">
+          <button class="btn btn-secondary btn-sm" disabled>
+            <span class="spinner" style="width:12px;height:12px;border-width:2px;"></span> 분석 중...
+          </button>
+        </span>
+      </div>
+      <div style="text-align:center;padding:24px;color:var(--text-muted);">
+        <div class="spinner" style="margin:0 auto 12px;"></div>
+        <div>상관분석 진행 중... 잠시 후 결과가 표시됩니다.</div>
+      </div>
+    </div>`;
+  }
+
+  if (r) {
+    const riskColor = { critical: 'var(--critical)', high: 'var(--high)', medium: 'var(--medium)', low: 'var(--low)' };
+    const rc = riskColor[(r.overall_risk || '').toLowerCase()] || 'var(--text-muted)';
+    const riskClass = (r.overall_risk || 'low').toLowerCase();
+
+    const flagHtml = [
+      { key: 'lateral_movement_detected', label: '횡전개', icon: '⚠️' },
+      { key: 'apt_indicators',            label: 'APT',   icon: '🚨' },
+      { key: 'attack_campaign',           label: '캠페인', icon: '🎯' },
+      { key: 'insider_threat_risk',       label: '내부자', icon: '👤' },
+    ].map(f => `
+      <span class="corr-flag ${r[f.key] ? 'on' : 'off'}">
+        ${f.icon} ${f.label} ${r[f.key] ? '감지' : '정상'}
+      </span>`).join('');
+
+    return `
+    <div class="card" id="dash-corr-card">
+      <div class="card-title">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--accent-cyan)" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/></svg>
+        상관분석 결과
+        <span style="margin-left:8px;font-size:11px;color:var(--text-muted);">
+          ${r.alert_count || '?'}건 · ${r.period_days || 7}일 기준
+        </span>
+        <span style="margin-left:auto;display:flex;gap:6px;">
+          <button class="btn btn-secondary btn-sm" onclick="showCorrelationModal()">상세보기</button>
+          <button class="btn btn-primary btn-sm" onclick="runDashboardCorrelation()">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>
+            재분석
+          </button>
+        </span>
+      </div>
+      <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:12px;">
+        <div>
+          <div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">전체 위험도</div>
+          <span class="corr-risk-badge ${riskClass}">${(r.overall_risk || '?').toUpperCase()}</span>
+        </div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;">${flagHtml}</div>
+      </div>
+      ${r.risk_summary ? `
+      <div style="padding:10px 14px;background:var(--bg-primary);border-left:3px solid ${rc};border-radius:4px;font-size:13px;color:var(--text-secondary);line-height:1.6;">
+        ${escHtml(String(r.risk_summary).slice(0, 300))}${(r.risk_summary||'').length > 300 ? '…' : ''}
+      </div>` : ''}
+    </div>`;
+  }
+
+  // 분석 결과 없음 → 분석 시작 버튼
+  return `
+  <div class="card" id="dash-corr-card">
+    <div class="card-title">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--accent-cyan)" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/></svg>
+      상관분석
+      <span style="margin-left:auto;">
+        <button class="btn btn-primary btn-sm" onclick="runDashboardCorrelation()" id="dash-corr-btn">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+          분석 시작 (최근 7일)
+        </button>
+      </span>
+    </div>
+    <div style="display:flex;align-items:center;gap:16px;padding:16px 0;color:var(--text-muted);">
+      <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="var(--border-light)" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/></svg>
+      <div>
+        <div style="font-size:14px;font-weight:600;color:var(--text-secondary);margin-bottom:4px;">상관분석 결과 없음</div>
+        <div style="font-size:12px;">AI가 최근 알람들의 패턴, 공격 캠페인, 횡전개 가능성을 분석합니다.<br>
+        <strong style="color:var(--accent-blue);">"분석 시작"</strong> 버튼을 클릭하면 최근 7일 데이터로 분석을 시작합니다.</div>
+      </div>
+    </div>
+  </div>`;
+}
+
+// 대시보드에서 상관분석 실행
+async function runDashboardCorrelation() {
+  const btn = document.getElementById('dash-corr-btn');
+  if (btn) btn.disabled = true;
+
+  _corrStatus.running = true;
+  _corrStatus.lastResult = null;
+
+  // 대시보드 상관분석 카드 업데이트
+  const card = document.getElementById('dash-corr-card');
+  if (card) {
+    card.innerHTML = `
+      <div class="card-title">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--accent-cyan)" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/></svg>
+        상관분석 진행 중
+        <span style="margin-left:auto;">
+          <button class="btn btn-secondary btn-sm" disabled>
+            <span class="spinner" style="width:12px;height:12px;border-width:2px;"></span> 분석 중...
+          </button>
+        </span>
+      </div>
+      <div style="padding:20px 0;">
+        <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text-muted);margin-bottom:6px;">
+          <span>AI 분석 중 (약 30-90초 소요)...</span>
+        </div>
+        <div class="progress-bar" style="height:8px;">
+          <div class="progress-fill" id="dash-corr-progress" style="width:5%;transition:width 1s;"></div>
+        </div>
+        <div style="margin-top:10px;font-size:12px;color:var(--text-muted);" id="dash-corr-step">알람 수집 중...</div>
+      </div>`;
+  }
+
+  // 진행 애니메이션
+  const steps = ['알람 데이터 수집 중...', 'IP·패턴 분석 중...', 'AI 추론 진행 중...', '결과 정리 중...'];
+  let step = 0;
+  const stepEl = document.getElementById('dash-corr-step');
+  const progEl = document.getElementById('dash-corr-progress');
+  const timer = setInterval(() => {
+    step = Math.min(step + 1, steps.length - 1);
+    if (stepEl) stepEl.textContent = steps[step];
+    if (progEl) progEl.style.width = `${Math.min(15 + step * 20, 80)}%`;
+  }, 12000);
+
+  try {
+    showToast('🕸 상관분석 시작 (최근 7일)', 'info');
+    const result = await api('/api/alerts/correlate', 'POST', { days: 7 });
+    clearInterval(timer);
+
+    if (result.success === false || result.error || result.detail) {
+      throw new Error(result.detail || result.error || '분석 실패');
+    }
+
+    // 결과 파싱 (runCorrelation과 동일 로직)
+    const corr = result.correlation || {};
+    const raw = typeof corr === 'string' ? {} : (corr.structured || corr.analysis || corr);
+    const analysis = raw.correlation_analysis || raw;
+    const recs = raw.recommendations || {};
+
+    const c = {
+      overall_risk: raw.overall_risk || analysis.overall_risk_level || 'unknown',
+      lateral_movement_detected: raw.lateral_movement_detected ?? analysis.lateral_movement_detected ?? false,
+      apt_indicators: raw.apt_indicators ?? analysis.apt_indicators ?? false,
+      attack_campaign: raw.attack_campaign ?? analysis.coordinated_attack_campaign ?? false,
+      insider_threat_risk: raw.insider_threat_risk ?? analysis.insider_threat_risk ?? false,
+      risk_summary: raw.risk_summary || raw.threat_summary || analysis.summary || '',
+    };
+
+    _corrStatus.running = false;
+    _corrStatus.lastResult = {
+      overall_risk: c.overall_risk,
+      lateral_movement_detected: c.lateral_movement_detected,
+      apt_indicators: c.apt_indicators,
+      attack_campaign: c.attack_campaign,
+      insider_threat_risk: c.insider_threat_risk,
+      risk_summary: c.risk_summary,
+      alert_count: result.alert_count,
+      period_days: result.period_days || 7,
+      _raw: result,
+    };
+
+    showToast(`✅ 상관분석 완료 - ${(c.overall_risk || '?').toUpperCase()} 위험`, 'success');
+
+    // 대시보드 다시 렌더링하여 결과 반영
+    await renderDashboard();
+  } catch(e) {
+    clearInterval(timer);
+    _corrStatus.running = false;
+    showToast(`❌ 상관분석 오류: ${e.message}`, 'error');
+    await renderDashboard();
+  }
+}
+
+// 상관분석 상세보기 (대시보드에서 호출, lastResult._raw 사용)
+function showCorrelationResultModal() {
+  if (!_corrStatus.lastResult?._raw) {
+    showCorrelationModal();
+    return;
+  }
+  // 기존 runCorrelation 결과 모달 재활용
+  const fakeResultDiv = document.createElement('div');
+  openModal(`
+    <div class="modal-header">
+      <div class="modal-title">🕸 상관분석 상세 결과</div>
+      <button class="modal-close" onclick="closeModal()">✕</button>
+    </div>
+    <div id="corr-result-detail"></div>
+  `);
+  // 결과 표시는 setTimeout으로 비동기 처리
+  setTimeout(() => {
+    const d = document.getElementById('corr-result-detail');
+    if (d) _renderCorrResult(d, _corrStatus.lastResult._raw);
+  }, 0);
+}
+
+function renderSeverityChart(bySev, isLight = false) {
   const ctx = document.getElementById('severity-chart');
   if (!ctx) return;
-  
+
   if (dashboardCharts.severity) {
     dashboardCharts.severity.destroy();
   }
-  
+
+  const legendColor = isLight ? '#4b5280' : '#9fa8da';
+  const borderColor = isLight ? '#f0f2f8' : '#1e2235';
+
   dashboardCharts.severity = new Chart(ctx, {
     type: 'doughnut',
     data: {
@@ -264,17 +512,18 @@ function renderSeverityChart(bySev) {
       datasets: [{
         data: [bySev.critical || 0, bySev.high || 0, bySev.medium || 0, bySev.low || 0, bySev.info || 0],
         backgroundColor: ['#ef233c', '#fb8500', '#ffd60a', '#06d6a0', '#4cc9f0'],
-        borderColor: '#1e2235',
+        borderColor,
         borderWidth: 2,
       }]
     },
     options: {
       responsive: true,
       maintainAspectRatio: false,
+      cutout: '65%',
       plugins: {
         legend: {
           position: 'right',
-          labels: { color: '#9fa8da', font: { size: 12 } }
+          labels: { color: legendColor, font: { size: 11 }, padding: 10 },
         }
       }
     }
@@ -285,6 +534,76 @@ async function updateDashboard() {
   if (currentPage === 'dashboard') {
     await renderDashboard();
   }
+}
+
+// 심각도 클릭 → 모달
+async function showAlertsBySeverity(severity, days) {
+  const params = new URLSearchParams({ days, limit: 30, page: 1 });
+  if (severity !== 'all') params.set('severity', severity);
+
+  const data = await api(`/api/alerts?${params}`);
+  _showAlertsListModal(
+    severity === 'all' ? '전체 알람' : `${severity.toUpperCase()} 알람`,
+    data, severity, days
+  );
+}
+
+// 유형 클릭 → 모달
+async function showAlertsByType(alertType, days) {
+  const params = new URLSearchParams({ days, limit: 30, page: 1, search: alertType });
+  const data = await api(`/api/alerts?${params}`);
+  _showAlertsListModal(`유형: ${alertType}`, data, null, days);
+}
+
+// 필터 클릭 → 모달
+async function showAlertsByFilter(filterType, days) {
+  const params = new URLSearchParams({ days, limit: 30, page: 1 });
+  if (filterType === 'fp') params.set('is_false_positive', 'true');
+  if (filterType === 'repeated') params.set('is_repeated', 'true');
+
+  const data = await api(`/api/alerts?${params}`);
+  const labels = { fp: '오탐 알람', repeated: '반복 알람' };
+  _showAlertsListModal(labels[filterType] || filterType, data, null, days);
+}
+
+// 알람 목록 모달 공통 렌더
+function _showAlertsListModal(title, data, severityFilter, days) {
+  const alerts = data.alerts || [];
+  const total  = data.total  || 0;
+
+  const rows = alerts.map(a => `
+    <tr style="cursor:pointer;" onclick="closeModal();showAlertDetail(${a.id})">
+      <td style="white-space:nowrap;font-size:12px;">${formatDate(a.received_at)}</td>
+      <td>${severityBadge(a.severity)}</td>
+      <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escHtml(a.subject||'')}">
+        ${escHtml(a.subject || '')}
+        ${a.is_false_positive ? '<span class="badge badge-fp" style="margin-left:4px;">오탐</span>' : ''}
+        ${a.is_repeated       ? '<span class="badge badge-rep" style="margin-left:4px;">반복</span>' : ''}
+      </td>
+      <td>${(a.extracted_ips||[]).slice(0,2).map(ip => `<span class="ip-chip">${ip}</span>`).join('')}</td>
+      <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--text-muted);">${escHtml(a.llm_summary||'미분석')}</td>
+    </tr>`).join('') || '<tr><td colspan="5" style="text-align:center;color:var(--text-muted);padding:24px;">알람 없음</td></tr>';
+
+  openModal(`
+    <div class="modal-header">
+      <div class="modal-title">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--accent-blue)" stroke-width="2" style="margin-right:6px;vertical-align:middle;"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>
+        ${escHtml(title)}
+        <span style="font-size:12px;color:var(--text-muted);margin-left:8px;">(${total}건 / 최근 ${days}일)</span>
+      </div>
+      <button class="modal-close" onclick="closeModal()">✕</button>
+    </div>
+    <div style="margin-bottom:10px;display:flex;gap:8px;">
+      <button class="btn btn-primary btn-sm" onclick="closeModal();navigate('alerts')">전체 알람 목록 →</button>
+    </div>
+    <div class="table-container" style="max-height:60vh;overflow-y:auto;">
+      <table>
+        <thead><tr><th>수신시간</th><th>심각도</th><th>제목</th><th>IP</th><th>AI 요약</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+    ${total > 30 ? `<div style="text-align:center;padding:10px;font-size:12px;color:var(--text-muted);">상위 30건 표시 중 (전체 ${total}건)</div>` : ''}
+  `);
 }
 
 // ============================================================
@@ -2637,39 +2956,95 @@ async function checkLLMStatus() {
 }
 
 async function checkDBStatus() {
-  const dot = document.getElementById('db-status-dot');
+  const dot  = document.getElementById('db-status-dot');
   const text = document.getElementById('db-status-text');
-  const sysInfo = await api('/api/settings/system-info');
-  
-  if (dot && text) {
-    // health check로 DB 동작 간접 확인
-    const health = await api('/health');
-    if (health.status === 'healthy') {
-      dot.className = 'status-dot';
-      dot.style.display = 'inline-block';
-      text.textContent = `DB: ${sysInfo.db_type || 'SQLite'}`;
-    } else {
+  const sysEl= document.getElementById('sys-info-text');
+
+  try {
+    // 실제 DB 동작 확인: 알람 통계 API 호출 (DB 없으면 실패)
+    // nginx /health 는 "ok", FastAPI /health 는 "healthy" 반환 → 둘 다 허용
+    const [health, stats] = await Promise.all([
+      api('/health'),
+      api('/api/alerts/stats?days=1'),
+    ]);
+
+    const healthOk = health?.status === 'healthy' || health?.status === 'ok';
+    const dbOk = healthOk && !stats?.error && stats?.total !== undefined;
+
+    if (dot && text) {
+      if (dbOk) {
+        dot.className = 'status-dot';
+        text.textContent = `PostgreSQL (${stats.total ?? '?'}건/일)`;
+      } else {
+        dot.className = 'status-dot error';
+        text.textContent = 'DB 연결 오류';
+      }
+    }
+
+    // 시스템 정보
+    const sysInfo = await api('/api/settings/system-info');
+    if (sysEl && !sysInfo?.error) {
+      sysEl.textContent = `UI:${sysInfo.frontend_port||61001}  API:${sysInfo.api_port||8000}`;
+    }
+  } catch(e) {
+    if (dot && text) {
       dot.className = 'status-dot error';
-      dot.style.display = 'inline-block';
-      text.textContent = 'DB: 오류';
+      text.textContent = 'DB 연결 오류';
     }
-    // 시스템 정보 표시
-    const sysEl = document.getElementById('sys-info-text');
-    if (sysEl) {
-      sysEl.textContent = `UI:${sysInfo.frontend_port||61001} API:${sysInfo.api_port||8000}`;
-    }
+  }
+}
+
+// ============================================================
+// 테마 전환
+// ============================================================
+function toggleTheme() {
+  const html = document.documentElement;
+  const current = html.getAttribute('data-theme') || 'dark';
+  const next = current === 'dark' ? 'light' : 'dark';
+  html.setAttribute('data-theme', next);
+  localStorage.setItem('secmail-theme', next);
+
+  const iconDark  = document.getElementById('theme-icon-dark');
+  const iconLight = document.getElementById('theme-icon-light');
+  if (iconDark && iconLight) {
+    iconDark.style.display  = next === 'dark'  ? 'block' : 'none';
+    iconLight.style.display = next === 'light' ? 'block' : 'none';
+  }
+
+  // Chart.js 차트 색상 업데이트
+  if (dashboardCharts.severity) {
+    const isLight = next === 'light';
+    dashboardCharts.severity.options.plugins.legend.labels.color = isLight ? '#4b5280' : '#9fa8da';
+    dashboardCharts.severity.data.datasets[0].borderColor = isLight ? '#f0f2f8' : '#1e2235';
+    dashboardCharts.severity.update();
+  }
+
+  showToast(next === 'light' ? '☀️ 라이트 테마로 변경' : '🌙 다크 테마로 변경', 'info');
+}
+
+function applyStoredTheme() {
+  const saved = localStorage.getItem('secmail-theme') || 'dark';
+  document.documentElement.setAttribute('data-theme', saved);
+  const iconDark  = document.getElementById('theme-icon-dark');
+  const iconLight = document.getElementById('theme-icon-light');
+  if (iconDark && iconLight) {
+    iconDark.style.display  = saved === 'dark'  ? 'block' : 'none';
+    iconLight.style.display = saved === 'light' ? 'block' : 'none';
   }
 }
 
 // 초기 렌더링
 window.addEventListener('DOMContentLoaded', async () => {
+  // 저장된 테마 적용
+  applyStoredTheme();
+
   // 시간대 설정 먼저 로드 (formatDate에서 사용)
   await loadAppTimezone();
 
   navigate('dashboard');
   checkLLMStatus();
   checkDBStatus();
-  
+
   // 5분마다 상태 체크
   setInterval(checkLLMStatus, 300000);
   setInterval(checkDBStatus, 300000);
