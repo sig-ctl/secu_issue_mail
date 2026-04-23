@@ -1,0 +1,157 @@
+name: secmail
+
+# ============================================================
+# Security Mail Analyzer - Docker Compose
+# NVIDIA GB10 (aarch64) / Host Network
+# Frontend  : 61001 (nginx)
+# Backend   : 8000  (FastAPI)
+# PostgreSQL: 5432
+# Ollama    : 11434 (Gemma3:4b)
+#
+# GPU 사용: sudo docker compose up -d --build
+# CPU 전용: sudo docker compose -f docker-compose.no-gpu.yml up -d --build
+# ============================================================
+
+services:
+
+  # ─── PostgreSQL ──────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: secmail_postgres
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB:-secmail}
+      POSTGRES_USER:     ${POSTGRES_USER:-secmail}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secmail_pass_2024}
+      PGDATA:            /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-secmail} -d ${POSTGRES_DB:-secmail}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # ─── Ollama + Gemma3:4b (NVIDIA GB10 GPU) ────────────────
+  # NVIDIA Container Toolkit 설치 후 GPU 사용 가능
+  # 미설치 시: docker-compose.no-gpu.yml 사용
+  ollama:
+    image: ollama/ollama:latest
+    container_name: secmail_ollama
+    network_mode: host
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+      - OLLAMA_NUM_PARALLEL=2
+      - OLLAMA_MAX_LOADED_MODELS=1
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      # ollama 이미지에는 curl 없음 → ollama CLI 사용
+      test: ["CMD-SHELL", "ollama list > /dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 15s
+      retries: 24          # 최대 6분 (24 × 15s)
+      start_period: 30s
+    logging:
+      driver: json-file
+      options: { max-size: "50m", max-file: "3" }
+
+  # ─── Gemma3:4b 자동 설치 (ollama healthy 후) ──────────────
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: secmail_ollama_init
+    network_mode: host
+    restart: "no"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_HOST=http://localhost:11434
+    entrypoint: >
+      /bin/sh -c "
+        echo '=== Gemma4:e4b 설치 시작 ===' &&
+        ollama pull gemma4:e4b &&
+        echo '=== gemma4:e4b 설치 완료 ==='
+      "
+
+  # ─── FastAPI Backend ──────────────────────────────────────
+  # PostgreSQL healthy 후 즉시 시작 (Ollama 의존 없음)
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    container_name: secmail_backend
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL:        postgresql+asyncpg://${POSTGRES_USER:-secmail}:${POSTGRES_PASSWORD:-secmail_pass_2024}@localhost:5432/${POSTGRES_DB:-secmail}
+      GMAIL_USER:          ${GMAIL_USER:-}
+      GMAIL_APP_PASSWORD:  ${GMAIL_APP_PASSWORD:-}
+      GMAIL_QUERY:         ${GMAIL_QUERY:-subject:security OR subject:alert OR subject:warning}
+      GMAIL_LABEL_IDS:     ${GMAIL_LABEL_IDS:-[]}
+      OLLAMA_URL:          http://localhost:11434
+      OLLAMA_MODEL:        ${OLLAMA_MODEL:-gemma4:e4b}
+      SMTP_HOST:           ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT:           ${SMTP_PORT:-587}
+      SMTP_USER:           ${SMTP_USER:-}
+      SMTP_PASSWORD:       ${SMTP_PASSWORD:-}
+      REPORT_RECIPIENTS:   ${REPORT_RECIPIENTS:-[]}
+      ABUSEIPDB_API_KEY:   ${ABUSEIPDB_API_KEY:-}
+      IPINFO_TOKEN:        ${IPINFO_TOKEN:-}
+      TZ:                  Asia/Seoul
+      PYTHONUNBUFFERED:    "1"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    logging:
+      driver: json-file
+      options: { max-size: "50m", max-file: "5" }
+
+  # ─── Nginx Frontend (port 61001) ──────────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: secmail_nginx
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:61001/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  postgres_data:
+    driver: local
+  ollama_data:
+    driver: local

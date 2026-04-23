@@ -4,11 +4,12 @@ LLM API 라우터
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, func, and_
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import uuid
+import os
 
 from ..models.database import SecurityAlert, ChatHistory, KnowledgeBase, get_db
 from ..services.llm_service import OllamaLLMService
@@ -44,88 +45,210 @@ async def pull_model(data: dict):
     return StreamingResponse(generate(), media_type="text/event-stream")
 
 
+async def _build_db_context(db: AsyncSession, days: int = 7) -> dict:
+    """DB에서 최근 알람 통계 및 목록을 가져와 채팅 컨텍스트 구성"""
+    try:
+        cutoff = datetime.utcnow() - timedelta(days=days)
+
+        # 전체 통계
+        total = (await db.execute(
+            select(func.count(SecurityAlert.id)).where(SecurityAlert.received_at >= cutoff)
+        )).scalar() or 0
+
+        # 심각도별 통계
+        sev_stats = {}
+        for sev in ['critical', 'high', 'medium', 'low', 'info']:
+            cnt = (await db.execute(
+                select(func.count(SecurityAlert.id)).where(
+                    and_(SecurityAlert.received_at >= cutoff, SecurityAlert.severity == sev)
+                )
+            )).scalar() or 0
+            sev_stats[sev] = cnt
+
+        # 오탐 통계
+        fp_count = (await db.execute(
+            select(func.count(SecurityAlert.id)).where(
+                and_(SecurityAlert.received_at >= cutoff, SecurityAlert.is_false_positive == True)
+            )
+        )).scalar() or 0
+
+        # 야간 알람
+        after_hours_count = (await db.execute(
+            select(func.count(SecurityAlert.id)).where(
+                and_(SecurityAlert.received_at >= cutoff, SecurityAlert.after_hours_access == True)
+            )
+        )).scalar() or 0
+
+        # 반복 알람
+        repeated_count = (await db.execute(
+            select(func.count(SecurityAlert.id)).where(
+                and_(SecurityAlert.received_at >= cutoff, SecurityAlert.is_repeated == True)
+            )
+        )).scalar() or 0
+
+        # 최근 알람 상세 (분석 완료 우선, 최대 20개)
+        recent_stmt = select(SecurityAlert).where(
+            SecurityAlert.received_at >= cutoff
+        ).order_by(
+            SecurityAlert.severity.asc(),   # critical 먼저
+            SecurityAlert.received_at.desc()
+        ).limit(20)
+        recent_result = await db.execute(recent_stmt)
+        recent_alerts = recent_result.scalars().all()
+
+        # 알람 목록 텍스트 구성
+        alert_lines = []
+        for a in recent_alerts:
+            tz_name = os.environ.get('APP_TIMEZONE', 'Asia/Seoul')
+            try:
+                from zoneinfo import ZoneInfo
+                local_dt = a.received_at.replace(tzinfo=__import__('datetime').timezone.utc).astimezone(ZoneInfo(tz_name)) if a.received_at else None
+                dt_str = local_dt.strftime('%m/%d %H:%M') if local_dt else '-'
+            except Exception:
+                dt_str = str(a.received_at)[:16] if a.received_at else '-'
+
+            ips = ", ".join((a.extracted_ips or [])[:3])
+            flags = []
+            if a.is_false_positive: flags.append("오탐")
+            if a.is_repeated:       flags.append(f"반복{a.repeat_count or 1}회")
+            if a.after_hours_access: flags.append("야간")
+            flag_str = f" [{','.join(flags)}]" if flags else ""
+
+            alert_lines.append(
+                f"  - ID:{a.id} [{(a.severity or '?').upper()}] {dt_str}"
+                f" | {(a.alert_type or '알람')} | {(a.subject or '')[:60]}"
+                + (f" | IP:{ips}" if ips else "")
+                + flag_str
+                + (f"\n    요약: {(a.llm_summary or '미분석')[:100]}" if a.llm_summary else "")
+            )
+
+        # 상위 위협 IP (반복 탐지)
+        from ..models.database import IPIntelligence
+        top_ip_result = await db.execute(
+            select(IPIntelligence).order_by(IPIntelligence.alert_count.desc()).limit(5)
+        )
+        top_ips = top_ip_result.scalars().all()
+        ip_lines = [
+            f"  - {ip.ip_address} ({ip.country or '?'}) 위협점수:{ip.threat_score or 0} 탐지:{ip.alert_count or 0}회"
+            for ip in top_ips
+        ]
+
+        return {
+            "total": total,
+            "sev_stats": sev_stats,
+            "fp_count": fp_count,
+            "after_hours_count": after_hours_count,
+            "repeated_count": repeated_count,
+            "alert_lines": alert_lines,
+            "ip_lines": ip_lines,
+            "days": days,
+        }
+    except Exception as e:
+        print(f"⚠️ DB 컨텍스트 빌드 오류: {e}")
+        return {"total": 0, "sev_stats": {}, "alert_lines": [], "ip_lines": [], "days": days}
+
+
+@router.get("/db-context")
+async def get_db_context(days: int = 7, db: AsyncSession = Depends(get_db)):
+    """채팅에 사용되는 DB 컨텍스트 미리보기 (디버깅용)"""
+    ctx = await _build_db_context(db, days)
+    return ctx
+
+
 @router.post("/chat")
 async def chat(
     data: dict,
     db: AsyncSession = Depends(get_db),
 ):
-    """LLM 채팅 (Q&A)"""
+    """LLM 채팅 (Q&A) - DB 알람 데이터 자동 컨텍스트 주입"""
     messages = data.get('messages', [])
     session_id = data.get('session_id', str(uuid.uuid4()))
     model = data.get('model', None)
     context_alert_ids = data.get('context_alert_ids', [])
-    
+    days = int(data.get('context_days', 7))
+
     if not messages:
         raise HTTPException(status_code=400, detail="메시지가 필요합니다.")
-    
-    # 컨텍스트 알람 조회
-    context_alerts = []
+
+    # 1) 특정 알람 컨텍스트 (alert_ids가 있을 때)
+    pinned_alerts = []
     if context_alert_ids:
         stmt = select(SecurityAlert).where(
             SecurityAlert.id.in_(context_alert_ids[:10])
         )
         result = await db.execute(stmt)
         alerts = result.scalars().all()
-        context_alerts = [
+        pinned_alerts = [
             {
                 "id": a.id,
                 "subject": a.subject,
                 "severity": a.severity,
+                "received_at": str(a.received_at)[:16] if a.received_at else '',
                 "llm_summary": a.llm_summary,
                 "llm_analysis": a.llm_analysis,
+                "llm_recommendation": a.llm_recommendation,
                 "extracted_ips": a.extracted_ips,
+                "extracted_domains": a.extracted_domains,
                 "alert_type": a.alert_type,
+                "is_false_positive": a.is_false_positive,
+                "after_hours_access": a.after_hours_access,
+                "repeat_count": a.repeat_count,
             }
             for a in alerts
         ]
-    
-    # 히스토리에서 이전 메시지 불러오기
+
+    # 2) DB 전체 통계 자동 주입 (매 채팅마다 최신 DB 상태 반영)
+    db_ctx = await _build_db_context(db, days)
+
+    # 3) 히스토리에서 이전 메시지 불러오기 (최근 10턴)
     history_stmt = select(ChatHistory).where(
         ChatHistory.session_id == session_id
-    ).order_by(ChatHistory.created_at.asc()).limit(10)
+    ).order_by(ChatHistory.created_at.asc()).limit(20)
     history_result = await db.execute(history_stmt)
     history = history_result.scalars().all()
-    
-    # 이전 대화 포함
+
     all_messages = []
     for h in history:
         if h.role in ('user', 'assistant'):
             all_messages.append({"role": h.role, "content": h.content})
     all_messages.extend(messages)
-    
-    # LLM 응답
+
+    # 4) LLM 응답 (DB 컨텍스트 포함)
     response = await llm_service.chat(
         messages=all_messages,
-        context_alerts=context_alerts,
+        pinned_alerts=pinned_alerts,
+        db_context=db_ctx,
         model=model,
     )
-    
-    # 히스토리 저장
+
+    # 5) 히스토리 저장
     for msg in messages:
-        chat_h = ChatHistory(
+        db.add(ChatHistory(
             session_id=session_id,
             role=msg['role'],
             content=msg['content'],
             context_alert_ids=context_alert_ids,
             model_used=model or llm_service.model,
-        )
-        db.add(chat_h)
-    
-    # 응답 저장
-    assistant_h = ChatHistory(
+        ))
+
+    db.add(ChatHistory(
         session_id=session_id,
         role="assistant",
         content=response,
         context_alert_ids=context_alert_ids,
         model_used=model or llm_service.model,
-    )
-    db.add(assistant_h)
+    ))
     await db.commit()
-    
+
     return {
         "response": response,
         "session_id": session_id,
         "model": model or llm_service.model,
+        "context_used": {
+            "total_alerts": db_ctx.get("total", 0),
+            "days": days,
+            "pinned_count": len(pinned_alerts),
+        }
     }
 
 
@@ -155,8 +278,6 @@ async def get_chat_history(session_id: str, db: AsyncSession = Depends(get_db)):
 @router.get("/sessions")
 async def get_sessions(db: AsyncSession = Depends(get_db)):
     """채팅 세션 목록"""
-    from sqlalchemy import func
-    
     stmt = select(
         ChatHistory.session_id,
         func.count(ChatHistory.id).label('message_count'),
