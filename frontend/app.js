@@ -9,6 +9,17 @@ let currentAlertPage = 1;
 let chatSessionId = null;
 let dashboardCharts = {};
 
+// 상관분석 전역 상태 (알람 목록 페이지 간 유지)
+let _corrStatus = { running: false, lastResult: null };
+// 시간대 설정 전역 변수 (formatDate에서 사용)
+let _appTimezone = 'Asia/Seoul';
+let _businessStartHour = 9;
+let _businessEndHour = 18;
+// 시간대 설정 라이브 시계 타이머
+let _tzClockTimer = null;
+// 상관분석 폴링 타이머
+let _corrPollingTimer = null;
+
 // ============================================================
 // 라우팅
 // ============================================================
@@ -279,27 +290,32 @@ async function updateDashboard() {
 // ============================================================
 // 알람 목록
 // ============================================================
+// 알람 필터 상태 (페이지 전환해도 유지)
+const _alertFilter = { severity: '', status: '', fp: '', search: '', days: '30' };
+
 async function renderAlerts(page = 1) {
   currentAlertPage = page;
-  
-  const severity = document.getElementById('filter-severity')?.value || '';
-  const status = document.getElementById('filter-status')?.value || '';
-  const fp = document.getElementById('filter-fp')?.value || '';
-  const search = document.getElementById('filter-search')?.value || '';
-  const days = document.getElementById('filter-days')?.value || '30';
-  
-  const params = new URLSearchParams({
-    page,
-    limit: 25,
-    days,
-    ...(severity && { severity }),
-    ...(status && { status }),
-    ...(fp && { is_false_positive: fp }),
-    ...(search && { search }),
-  });
-  
+
+  // 필터바가 이미 존재하면 현재 값 읽기, 없으면 저장된 상태 사용
+  const filterBar = document.getElementById('alerts-filter-bar');
+  if (filterBar) {
+    _alertFilter.severity = document.getElementById('filter-severity')?.value || '';
+    _alertFilter.status   = document.getElementById('filter-status')?.value   || '';
+    _alertFilter.fp       = document.getElementById('filter-fp')?.value       || '';
+    _alertFilter.search   = document.getElementById('filter-search')?.value   || '';
+    _alertFilter.days     = document.getElementById('filter-days')?.value     || '30';
+  }
+
+  const { severity, status, fp, search, days } = _alertFilter;
+
+  const params = new URLSearchParams({ page, limit: 25, days });
+  if (severity) params.set('severity', severity);
+  if (status)   params.set('status', status);
+  if (fp)       params.set('is_false_positive', fp);
+  if (search)   params.set('search', search);
+
   const data = await api(`/api/alerts?${params}`);
-  
+
   const rows = (data.alerts || []).map(a => `
     <tr style="cursor:pointer;" onclick="showAlertDetail(${a.id})">
       <td style="color:var(--text-muted);font-size:12px;white-space:nowrap;">${formatDate(a.received_at)}</td>
@@ -315,9 +331,10 @@ async function renderAlerts(page = 1) {
       <td>
         ${a.is_false_positive ? '<span class="badge badge-fp">오탐</span>' : ''}
         ${a.is_repeated ? `<span class="badge badge-rep">반복 ${a.repeat_count || 1}회</span>` : ''}
+        ${a.after_hours_access ? '<span class="badge" style="background:rgba(255,140,0,0.2);color:#ffa500;border:1px solid rgba(255,140,0,0.4);">🌙야간</span>' : ''}
       </td>
       <td>
-        ${(a.extracted_ips || []).slice(0,2).map(ip => 
+        ${(a.extracted_ips || []).slice(0,2).map(ip =>
           `<span class="ip-chip" onclick="event.stopPropagation();lookupIP('${ip}')">${ip}</span>`
         ).join('')}
       </td>
@@ -332,62 +349,79 @@ async function renderAlerts(page = 1) {
         </div>
       </td>
     </tr>`).join('') || '<tr><td colspan="8" style="text-align:center;color:var(--text-muted);padding:30px;">알람이 없습니다</td></tr>';
-  
-  // 페이지네이션
+
   const totalPages = data.pages || 1;
   const paginationHtml = generatePagination(page, totalPages, 'renderAlerts');
-  
-  document.getElementById('page-content').innerHTML = `
-    <div class="card" style="margin-bottom:16px;">
-      <div class="filter-bar">
-        <input class="form-input" id="filter-search" placeholder="🔍 검색..." value="" style="width:200px;" onkeydown="if(event.key==='Enter')renderAlerts(1)">
-        <select class="form-select" id="filter-severity" style="width:120px;" onchange="renderAlerts(1)">
-          <option value="">모든 심각도</option>
-          <option value="critical">Critical</option>
-          <option value="high">High</option>
-          <option value="medium">Medium</option>
-          <option value="low">Low</option>
-          <option value="info">Info</option>
-        </select>
-        <select class="form-select" id="filter-fp" style="width:110px;" onchange="renderAlerts(1)">
-          <option value="">오탐 전체</option>
-          <option value="false">실제 위협</option>
-          <option value="true">오탐</option>
-        </select>
-        <select class="form-select" id="filter-status" style="width:110px;" onchange="renderAlerts(1)">
-          <option value="">모든 상태</option>
-          <option value="new">신규</option>
-          <option value="analyzed">분석완료</option>
-          <option value="closed">종료</option>
-        </select>
-        <select class="form-select" id="filter-days" style="width:80px;" onchange="renderAlerts(1)">
-          <option value="7">7일</option>
-          <option value="30" selected>30일</option>
-          <option value="90">90일</option>
-          <option value="365">365일</option>
-        </select>
-        <button class="btn btn-primary btn-sm" onclick="renderAlerts(1)">적용</button>
-        <span style="margin-left:auto;color:var(--text-muted);font-size:12px;">
-          총 ${data.total || 0}건
-        </span>
+
+  // 필터바가 없을 때만 전체 레이아웃 렌더링 (최초 1회)
+  if (!document.getElementById('alerts-filter-bar')) {
+    document.getElementById('page-content').innerHTML = `
+      <div class="card" style="margin-bottom:16px;">
+        <div class="filter-bar" id="alerts-filter-bar">
+          <input class="form-input" id="filter-search" placeholder="🔍 검색..." style="width:200px;" onkeydown="if(event.key==='Enter')renderAlerts(1)">
+          <select class="form-select" id="filter-severity" style="width:120px;" onchange="renderAlerts(1)">
+            <option value="">모든 심각도</option>
+            <option value="critical">Critical</option>
+            <option value="high">High</option>
+            <option value="medium">Medium</option>
+            <option value="low">Low</option>
+            <option value="info">Info</option>
+          </select>
+          <select class="form-select" id="filter-fp" style="width:110px;" onchange="renderAlerts(1)">
+            <option value="">오탐 전체</option>
+            <option value="false">실제 위협</option>
+            <option value="true">오탐</option>
+          </select>
+          <select class="form-select" id="filter-status" style="width:110px;" onchange="renderAlerts(1)">
+            <option value="">모든 상태</option>
+            <option value="new">신규</option>
+            <option value="analyzed">분석완료</option>
+            <option value="closed">종료</option>
+          </select>
+          <select class="form-select" id="filter-days" style="width:80px;" onchange="renderAlerts(1)">
+            <option value="7">7일</option>
+            <option value="30">30일</option>
+            <option value="90">90일</option>
+            <option value="365">365일</option>
+          </select>
+          <button class="btn btn-primary btn-sm" onclick="renderAlerts(1)">적용</button>
+          <button class="btn btn-secondary btn-sm" onclick="resetAlertFilters()">🔄 초기화</button>
+          <button class="btn btn-secondary btn-sm" onclick="analyzeAllPending()" title="미분석 알람 일괄 분석">🤖 일괄분석</button>
+          <button class="btn btn-secondary btn-sm" id="corr-btn" onclick="showCorrelationModal()" title="알람 상관분석 (2차 침해·횡전개·APT 탐지)">🕸 상관분석</button>
+          <span id="alerts-total-badge" style="margin-left:auto;color:var(--text-muted);font-size:12px;"></span>
+        </div>
+        <div id="corr-status-bar" style="display:none;margin-top:8px;padding:8px 12px;background:var(--bg-primary);border:1px solid var(--border);border-radius:8px;font-size:12px;"></div>
       </div>
-    </div>
-    
-    <div class="card">
-      <div class="table-container">
-        <table>
-          <thead>
-            <tr>
-              <th>수신시간</th><th>심각도</th><th>제목 / 발신자</th><th>분류</th>
-              <th>탐지 IP</th><th>AI 요약</th><th>상태</th><th>액션</th>
-            </tr>
-          </thead>
-          <tbody>${rows}</tbody>
-        </table>
-      </div>
-      ${paginationHtml}
-    </div>
-  `;
+      <div class="card">
+        <div class="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th>수신시간</th><th>심각도</th><th>제목 / 발신자</th><th>분류</th>
+                <th>탐지 IP</th><th>AI 요약</th><th>상태</th><th>액션</th>
+              </tr>
+            </thead>
+            <tbody id="alerts-tbody"></tbody>
+          </table>
+        </div>
+        <div id="alerts-pagination"></div>
+      </div>`;
+
+    // 저장된 필터값 복원
+    document.getElementById('filter-severity').value = _alertFilter.severity;
+    document.getElementById('filter-fp').value       = _alertFilter.fp;
+    document.getElementById('filter-status').value   = _alertFilter.status;
+    document.getElementById('filter-days').value     = _alertFilter.days;
+    document.getElementById('filter-search').value   = _alertFilter.search;
+  }
+
+  // 테이블 내용과 페이지네이션만 업데이트 (필터바 DOM 유지)
+  document.getElementById('alerts-tbody').innerHTML = rows;
+  document.getElementById('alerts-pagination').innerHTML = paginationHtml;
+  document.getElementById('alerts-total-badge').textContent = `총 ${data.total || 0}건`;
+
+  // 상관분석 상태바 복원
+  _updateCorrStatusBar();
 }
 
 // ============================================================
@@ -419,6 +453,7 @@ async function showAlertDetail(alertId) {
           ${severityBadge(alert.severity)}
           ${alert.is_false_positive ? '<span class="badge badge-fp">오탐</span>' : ''}
           ${alert.is_repeated ? `<span class="badge badge-rep">반복 ${alert.repeat_count || 1}회</span>` : ''}
+          ${alert.after_hours_access ? '<span class="badge" style="background:rgba(255,140,0,0.2);color:#ffa500;border:1px solid rgba(255,140,0,0.4);">🌙 시간외</span>' : ''}
           ${statusBadge(alert.status)}
         </div>
       </div>
@@ -429,7 +464,7 @@ async function showAlertDetail(alertId) {
       <div class="detail-title">📧 메일 정보</div>
       <div class="detail-content" style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
         <div><span style="color:var(--text-muted);">발신자:</span> ${escHtml(alert.sender || '-')}</div>
-        <div><span style="color:var(--text-muted);">수신시간:</span> ${formatDate(alert.received_at)}</div>
+        <div><span style="color:var(--text-muted);">수신시간:</span> ${formatDateFull(alert.received_at)} ${alert.after_hours_access ? '<span style="color:#ffa500;font-size:11px;">🌙 업무시간 외</span>' : ''}</div>
         <div><span style="color:var(--text-muted);">수신자:</span> ${escHtml(alert.recipient || '-')}</div>
         <div><span style="color:var(--text-muted);">알람 유형:</span> ${escHtml(alert.alert_type || '-')}</div>
       </div>
@@ -468,6 +503,11 @@ async function showAlertDetail(alertId) {
         </div>
         <div class="detail-content" style="color:var(--accent-green);">${escHtml(alert.llm_recommendation || '')}</div>` : ''}
         
+        ${alert.after_hours_access ? `
+        <div style="margin-top:12px;padding:10px;background:rgba(255,140,0,0.1);border-radius:6px;border:1px solid rgba(255,140,0,0.3);">
+          <span style="color:#ffa500;font-size:12px;font-weight:600;">🌙 시간외 접속 감지</span>
+          <div class="detail-content" style="margin-top:4px;color:var(--text-secondary);">${escHtml(alert.llm_analysis?.includes('시간외') || alert.llm_analysis?.includes('야간') || alert.llm_analysis?.includes('주말') ? (alert.llm_analysis.match(/[^.]*(?:시간외|야간|주말)[^.]*\.?/)?.[0] || '업무시간 외 발생 알람입니다.') : '업무시간 외(야간/주말) 발생 알람입니다. 추가 확인이 필요합니다.')}</div>
+        </div>` : ''}
         ${alert.is_false_positive && alert.false_positive_reason ? `
         <div style="margin-top:12px;padding:10px;background:rgba(123,45,139,0.1);border-radius:6px;border:1px solid rgba(123,45,139,0.3);">
           <span style="color:#c77dff;font-size:12px;font-weight:600;">⚠️ 오탐 이유:</span>
@@ -853,66 +893,105 @@ async function renderHistory() {
 // ============================================================
 // AI 채팅
 // ============================================================
-function renderChat() {
+// 채팅 컨텍스트: 분석 기간 (일)
+let _chatContextDays = 7;
+
+async function renderChat() {
   if (!chatSessionId) {
     chatSessionId = 'session_' + Date.now();
   }
-  
+
+  // DB 컨텍스트 미리 로드 (통계 표시용)
+  const dbCtx = await api('/api/llm/db-context?days=7').catch(() => ({}));
+  const total = dbCtx.total || 0;
+  const sev = dbCtx.sev_stats || {};
+  const ctxBadge = total > 0
+    ? `<span style="font-size:11px;background:rgba(6,214,160,0.15);color:var(--accent-green);border:1px solid rgba(6,214,160,0.3);border-radius:4px;padding:2px 8px;">
+        📊 DB 연결: ${total}건 (C:${sev.critical||0} H:${sev.high||0} M:${sev.medium||0})
+       </span>`
+    : `<span style="font-size:11px;background:rgba(255,200,0,0.1);color:#ffa500;border:1px solid rgba(255,200,0,0.3);border-radius:4px;padding:2px 8px;">
+        ⚠️ 분석된 알람 없음 (수집 후 LLM 분석 필요)
+       </span>`;
+
+  const quickQuestions = [
+    { icon: '🚨', text: '지금 가장 위험한 알람은 무엇인가요?', q: '현재 DB에 있는 알람 중 가장 위험한 것은 무엇인가요? Critical/High 알람을 중심으로 설명해주세요.' },
+    { icon: '📊', text: '최근 7일 보안 현황 요약', q: '최근 7일간의 보안 알람 현황을 요약해주세요. 심각도별 분포, 주요 위협, 오탐 현황을 포함해주세요.' },
+    { icon: '🔄', text: '반복 알람 패턴 분석', q: '반복적으로 발생하는 알람의 패턴을 분석해주세요. 원인과 해결 방안도 알려주세요.' },
+    { icon: '🌙', text: '야간 알람 분석', q: '업무시간 외(야간/주말) 발생한 알람을 분석해주세요. 이상 접속 여부와 대응 방안을 알려주세요.' },
+    { icon: '🌐', text: '위협 IP 분석', q: '탐지된 위협 IP 목록을 분석해주세요. 어떤 공격 패턴인지, 차단해야 할 IP는 무엇인지 알려주세요.' },
+    { icon: '❓', text: '오탐 줄이는 방법', q: '현재 오탐(False Positive) 알람을 줄이는 방법을 알려주세요. 현재 오탐 패턴도 분석해주세요.' },
+    { icon: '🛡️', text: '즉각 조치 필요 항목', q: '지금 당장 조치가 필요한 보안 이슈는 무엇인가요? 우선순위와 구체적인 조치 방법을 알려주세요.' },
+    { icon: '📈', text: '공격 트렌드 분석', q: '최근 공격 트렌드와 패턴을 분석해주세요. 어떤 유형의 공격이 증가하고 있나요?' },
+  ];
+
   document.getElementById('page-content').innerHTML = `
     <div class="grid-2" style="height:calc(100vh - 140px);">
       <!-- 채팅 -->
-      <div class="card" style="display:flex;flex-direction:column;height:100%;">
-        <div class="card-title">
+      <div class="card" style="display:flex;flex-direction:column;height:100%;overflow:hidden;">
+        <div class="card-title" style="flex-shrink:0;">
           🤖 AI 보안 분석 채팅
-          <button class="btn btn-secondary btn-sm" style="margin-left:auto;" onclick="newChatSession()">새 세션</button>
+          <div style="margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+            ${ctxBadge}
+            <button class="btn btn-secondary btn-sm" onclick="newChatSession()">새 세션</button>
+          </div>
         </div>
+
+        <!-- DB 연결 상태 배너 -->
+        ${total === 0 ? `
+        <div style="flex-shrink:0;padding:10px 14px;background:rgba(255,140,0,0.1);border:1px solid rgba(255,140,0,0.3);border-radius:6px;margin-bottom:10px;font-size:12px;color:#ffa500;">
+          ⚠️ <strong>분석된 알람 데이터가 없습니다.</strong> 
+          Gmail 설정에서 메일 수집 후 LLM 분석을 진행하면 실제 보안 데이터 기반 답변이 가능합니다.
+          <button class="btn btn-secondary btn-sm" style="margin-left:8px;" onclick="navigate('gmail-config')">📥 메일 수집 설정</button>
+        </div>` : ''}
         
-        <div id="chat-messages" style="flex:1;overflow-y:auto;">
+        <div id="chat-messages" style="flex:1;overflow-y:auto;min-height:0;">
           <div class="chat-message assistant">
             <div class="chat-avatar">🤖</div>
-            <div class="chat-bubble">
-              안녕하세요! 보안 AI 어시스턴트입니다.<br><br>
-              보안 알람 분석, 위협 평가, 대응 방안 등 무엇이든 질문해 주세요.<br><br>
-              <strong>예시 질문:</strong><br>
-              • 최근 가장 위협적인 공격 패턴이 무엇인가요?<br>
-              • 특정 IP가 악성인지 판단해 주세요<br>
-              • 오탐을 줄이는 방법은?<br>
-              • 알람 대응 우선순위를 알려주세요
+            <div class="chat-bubble" style="white-space:pre-wrap;">안녕하세요! 보안 AI 어시스턴트입니다.
+
+현재 <strong>DB의 실제 알람 데이터를 기반</strong>으로 답변합니다.
+${total > 0 
+  ? `📊 연결된 데이터: 최근 7일 ${total}건 (Critical:${sev.critical||0} / High:${sev.high||0} / Medium:${sev.medium||0})`
+  : '⚠️ 아직 수집/분석된 알람이 없습니다.'}
+
+오른쪽의 빠른 질문 버튼을 클릭하거나, 직접 질문을 입력하세요.
             </div>
           </div>
         </div>
         
-        <div style="display:flex;gap:8px;margin-top:12px;">
-          <select class="form-select" id="chat-model" style="width:160px;">
+        <div style="flex-shrink:0;display:flex;gap:8px;margin-top:10px;">
+          <select class="form-select" id="chat-model" style="width:140px;">
             <option value="">기본 모델</option>
           </select>
-          <input class="form-input" id="chat-input" placeholder="질문을 입력하세요..." 
+          <select class="form-select" id="chat-days" style="width:80px;" onchange="_chatContextDays=parseInt(this.value)">
+            <option value="7" selected>7일</option>
+            <option value="30">30일</option>
+            <option value="90">90일</option>
+          </select>
+          <input class="form-input" id="chat-input" placeholder="보안 알람에 대해 질문하세요... (Enter 전송)" 
                  style="flex:1;" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChat();}">
           <button class="btn btn-primary" onclick="sendChat()">전송</button>
         </div>
+        <div style="flex-shrink:0;font-size:11px;color:var(--text-muted);margin-top:4px;">
+          💡 DB의 실제 알람 데이터가 자동으로 AI 컨텍스트에 포함됩니다
+        </div>
       </div>
       
-      <!-- 세션 목록 & 컨텍스트 -->
+      <!-- 빠른 질문 & 세션 -->
       <div style="display:flex;flex-direction:column;gap:16px;height:100%;overflow:hidden;">
-        <div class="card" style="flex:1;overflow-y:auto;">
-          <div class="card-title">📋 빠른 분석 질문</div>
-          <div style="display:flex;flex-direction:column;gap:6px;">
-            ${[
-              '최근 7일 가장 위험한 알람은?',
-              'Critical 알람들의 공통 패턴 분석',
-              '오탐으로 분류된 알람 패턴은?',
-              '반복 알람의 원인 분석',
-              '보안 권고사항 top 5',
-              'IP 위협 트렌드 분석',
-            ].map(q => `
-              <button class="btn btn-secondary btn-sm" style="text-align:left;justify-content:flex-start;" 
-                      onclick="setQuickChat('${q}')">
-                💬 ${q}
+        <div class="card" style="flex:1;overflow-y:auto;min-height:0;">
+          <div class="card-title">⚡ 빠른 분석 질문</div>
+          <div style="display:flex;flex-direction:column;gap:5px;">
+            ${quickQuestions.map(({icon, text, q}) => `
+              <button class="btn btn-secondary btn-sm" 
+                      style="text-align:left;justify-content:flex-start;padding:7px 10px;" 
+                      onclick="sendQuickChat(${JSON.stringify(q)})">
+                ${icon} ${text}
               </button>`).join('')}
           </div>
         </div>
         
-        <div class="card" style="flex:1;overflow-y:auto;">
+        <div class="card" style="flex:1;overflow-y:auto;min-height:0;">
           <div class="card-title">📚 세션 히스토리</div>
           <div id="session-list">로딩 중...</div>
         </div>
@@ -963,6 +1042,13 @@ function setQuickChat(text) {
   }
 }
 
+// 빠른 질문 버튼: 바로 전송
+async function sendQuickChat(text) {
+  const input = document.getElementById('chat-input');
+  if (input) input.value = text;
+  await sendChat();
+}
+
 async function sendChat() {
   const input = document.getElementById('chat-input');
   const text = input?.value?.trim();
@@ -973,6 +1059,7 @@ async function sendChat() {
   appendChatMessage('user', text);
   
   const model = document.getElementById('chat-model')?.value || null;
+  const days  = parseInt(document.getElementById('chat-days')?.value || _chatContextDays || 7);
   
   // 타이핑 표시
   const typingId = 'typing_' + Date.now();
@@ -982,13 +1069,39 @@ async function sendChat() {
     messages: [{ role: 'user', content: text }],
     session_id: chatSessionId,
     model: model || undefined,
+    context_days: days,
   });
   
   // 타이핑 제거 후 실제 응답 표시
   const typingEl = document.getElementById(typingId);
   if (typingEl) typingEl.closest('.chat-message').remove();
   
-  appendChatMessage('assistant', result.response || '응답을 받지 못했습니다.');
+  const response = result.response || '응답을 받지 못했습니다.';
+  appendChatMessage('assistant', response);
+
+  // 컨텍스트 정보 표시 (디버그)
+  if (result.context_used && result.context_used.total_alerts > 0) {
+    const ctx = result.context_used;
+    // 기존 컨텍스트 배지 업데이트
+    const badge = document.querySelector('.card-title [style*="accent-green"]');
+    if (badge) badge.textContent = `📊 DB 연결: ${ctx.total_alerts}건`;
+  }
+}
+
+// 마크다운 간단 렌더링 (Bold, 목록, 헤더)
+function renderMarkdown(text) {
+  if (!text) return '';
+  return escHtml(text)
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*(.+?)\*/g, '<em>$1</em>')
+    .replace(/^### (.+)$/gm, '<div style="font-size:14px;font-weight:700;color:var(--text-primary);margin:10px 0 4px;">$1</div>')
+    .replace(/^## (.+)$/gm, '<div style="font-size:15px;font-weight:700;color:var(--accent-cyan);margin:12px 0 4px;">$1</div>')
+    .replace(/^# (.+)$/gm, '<div style="font-size:16px;font-weight:700;color:var(--accent-blue);margin:12px 0 6px;">$1</div>')
+    .replace(/^[-•] (.+)$/gm, '<div style="padding-left:12px;">• $1</div>')
+    .replace(/^\d+\. (.+)$/gm, '<div style="padding-left:12px;">$&</div>')
+    .replace(/`([^`]+)`/g, '<code style="background:rgba(100,100,200,0.15);padding:1px 5px;border-radius:3px;font-family:monospace;font-size:12px;">$1</code>')
+    .replace(/\n\n/g, '<br><br>')
+    .replace(/\n/g, '<br>');
 }
 
 function appendChatMessage(role, content, id = null) {
@@ -998,10 +1111,14 @@ function appendChatMessage(role, content, id = null) {
   const div = document.createElement('div');
   div.className = `chat-message ${role}`;
   if (id) div.id = id;
+
+  const bubbleContent = content === '...'
+    ? '<div class="spinner" style="width:16px;height:16px;"></div>'
+    : (role === 'assistant' ? renderMarkdown(content) : escHtml(content));
   
   div.innerHTML = `
     <div class="chat-avatar">${role === 'user' ? '👤' : '🤖'}</div>
-    <div class="chat-bubble">${content === '...' ? '<div class="spinner" style="width:16px;height:16px;"></div>' : escHtml(content)}</div>
+    <div class="chat-bubble" style="line-height:1.7;">${bubbleContent}</div>
   `;
   
   container.appendChild(div);
@@ -1010,15 +1127,17 @@ function appendChatMessage(role, content, id = null) {
 
 function newChatSession() {
   chatSessionId = 'session_' + Date.now();
+  _chatContextAlertIds = [];
   const container = document.getElementById('chat-messages');
   if (container) {
     container.innerHTML = `
       <div class="chat-message assistant">
         <div class="chat-avatar">🤖</div>
-        <div class="chat-bubble">새 채팅 세션이 시작되었습니다.</div>
+        <div class="chat-bubble">새 채팅 세션이 시작되었습니다. DB의 최신 알람 데이터가 자동으로 컨텍스트에 포함됩니다.</div>
       </div>
     `;
   }
+  loadChatSessions();
 }
 
 async function loadSession(sessionId) {
@@ -1034,15 +1153,52 @@ async function loadSession(sessionId) {
   });
 }
 
+// 알람 상세에서 AI 질의 → 해당 알람을 컨텍스트로 채팅
+let _chatContextAlertIds = [];
+
 function openChatWithContext(alertId) {
+  _chatContextAlertIds = [alertId];
   navigate('chat');
-  setTimeout(() => {
+  setTimeout(async () => {
+    // 알람 정보 미리 가져와서 채팅에 주입
+    const alert = await api(`/api/alerts/${alertId}`);
+    const subject = alert.subject ? `"${alert.subject.slice(0, 50)}"` : `ID:${alertId}`;
     const input = document.getElementById('chat-input');
     if (input) {
-      input.value = `알람 ID ${alertId}에 대해 분석해줘`;
+      input.value = `알람 ${subject} (ID:${alertId})에 대해 상세 분석해주세요. 위험도 평가와 대응 방안을 알려주세요.`;
       input.focus();
     }
-  }, 500);
+    // 알람 컨텍스트 배지 표시
+    const title = document.querySelector('#chat-messages + div');
+  }, 600);
+}
+
+async function _sendChatWithAlertContext(text, alertIds) {
+  const input = document.getElementById('chat-input');
+  if (input) input.value = text;
+
+  const model = document.getElementById('chat-model')?.value || null;
+  const days  = parseInt(document.getElementById('chat-days')?.value || _chatContextDays || 7);
+
+  appendChatMessage('user', text);
+  if (input) input.value = '';
+
+  const typingId = 'typing_' + Date.now();
+  appendChatMessage('assistant', '...', typingId);
+
+  const result = await api('/api/llm/chat', 'POST', {
+    messages: [{ role: 'user', content: text }],
+    session_id: chatSessionId,
+    model: model || undefined,
+    context_alert_ids: alertIds,
+    context_days: days,
+  });
+
+  const typingEl = document.getElementById(typingId);
+  if (typingEl) typingEl.closest('.chat-message').remove();
+
+  appendChatMessage('assistant', result.response || '응답을 받지 못했습니다.');
+  _chatContextAlertIds = [];
 }
 
 // ============================================================
@@ -1128,31 +1284,84 @@ async function addKnowledge() {
 // ============================================================
 async function renderGmailConfig() {
   const status = await api('/api/gmail/status');
-  const labels = await api('/api/gmail/labels');
   const envData = await api('/api/settings/env');
-  
-  const labelOptions = (labels.labels || []).map(l => 
-    `<option value="${l.id}">${l.name}</option>`
-  ).join('');
-  
-  const connectedHtml = status.connected 
-    ? `<div style="color:var(--accent-green);font-size:14px;font-weight:bold;">✅ 연결됨 ${status.user ? `(${status.user})` : ''}</div>`
-    : `<div style="color:var(--critical);font-size:14px;font-weight:bold;">❌ 연결 안됨 - 아래에서 인증하세요</div>`;
-  
+
+  // OAuth 모드면 Gmail 레이블도 조회
+  let oauthLabels = [];
+  if (status.method === 'oauth' && status.connected) {
+    const labelsResp = await api('/api/gmail/labels');
+    oauthLabels = labelsResp.labels || [];
+  }
+
+  const connectedHtml = status.connected
+    ? `<div style="color:var(--accent-green);font-size:14px;font-weight:bold;">✅ 연결됨 (${status.method === 'oauth' ? 'OAuth' : 'App Password'}) ${status.user ? `· ${status.user}` : ''}</div>`
+    : `<div style="color:var(--critical);font-size:14px;font-weight:bold;">❌ 연결 안됨 — 아래에서 인증하세요</div>`;
+
+  // 수집 설정 탭 — OAuth: 레이블 드롭다운 / App Password: 메일함 텍스트 입력
+  const fetchMailboxHtml = status.method === 'oauth' && oauthLabels.length > 0
+    ? `<div class="form-group">
+        <label class="form-label">수집할 레이블 (Ctrl+클릭으로 다중 선택)</label>
+        <select class="form-select" id="fetch-label" multiple style="height:120px;">
+          ${oauthLabels.map(l => `<option value="${l.id}">${l.name}</option>`).join('')}
+        </select>
+      </div>`
+    : `<div class="form-group">
+        <label class="form-label">수집할 메일함 (IMAP 폴더명)</label>
+        <div style="display:flex;gap:8px;align-items:flex-end;">
+          <input class="form-input" id="fetch-mailbox" placeholder="INBOX" value="${envData.gmail_mailbox || 'INBOX'}" style="flex:1;">
+          <button class="btn btn-secondary" style="white-space:nowrap;" onclick="loadImapMailboxes()">📂 폴더 목록</button>
+        </div>
+        <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
+          일반: <code>INBOX</code> · 전체보관함: <code>[Gmail]/All Mail</code> · 스팸: <code>[Gmail]/Spam</code>
+        </div>
+        <div id="imap-mailbox-list" style="margin-top:8px;"></div>
+      </div>`;
+
   document.getElementById('page-content').innerHTML = `
     <div class="card" style="margin-bottom:16px;">
       <div class="card-title">📧 Gmail 연결 상태</div>
       ${connectedHtml}
-      <div style="margin-top:12px;font-size:13px;color:var(--text-muted);">${status.message || ''}</div>
+      <div style="margin-top:6px;font-size:13px;color:var(--text-muted);">${status.message || ''}</div>
     </div>
-    
+
     <div class="tabs">
-      <div class="tab active" onclick="switchTab('gmail-oauth', this)">OAuth 인증</div>
-      <div class="tab" onclick="switchTab('gmail-apppass', this)">App Password</div>
+      <div class="tab active" onclick="switchTab('gmail-apppass', this)">App Password</div>
+      <div class="tab" onclick="switchTab('gmail-oauth', this)">OAuth 인증</div>
       <div class="tab" onclick="switchTab('gmail-fetch', this)">수집 설정</div>
     </div>
-    
-    <div id="gmail-oauth" class="tab-content">
+
+    <div id="gmail-apppass" class="tab-content">
+      <div class="card">
+        <div class="card-title">🔑 App Password 설정</div>
+        ${envData.gmail_user && envData.gmail_app_password
+          ? `<div style="background:#1a3a2a;border:1px solid var(--accent-green);border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:13px;">
+              ✅ <strong>저장된 계정:</strong> ${envData.gmail_user} &nbsp;·&nbsp; 비밀번호: ****저장됨
+            </div>`
+          : `<div style="background:#3a1a1a;border:1px solid var(--critical);border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:13px;">
+              ⚠️ 아직 App Password가 설정되지 않았습니다.
+            </div>`
+        }
+        <div style="font-size:13px;color:var(--text-muted);margin-bottom:16px;line-height:1.8;">
+          Gmail 계정 → <strong>Google 계정 보안</strong> → <strong>2단계 인증 활성화</strong> →
+          <a href="https://myaccount.google.com/apppasswords" target="_blank" style="color:var(--accent-blue);">앱 비밀번호 생성</a>
+          (앱: 기타, 이름: SecMail)
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label">Gmail 계정</label>
+            <input class="form-input" id="ap-email" type="email" placeholder="your@gmail.com" value="${envData.gmail_user || ''}">
+          </div>
+          <div class="form-group">
+            <label class="form-label">앱 비밀번호 (16자리, 공백 없이 입력)</label>
+            <input class="form-input" id="ap-password" type="password"
+              placeholder="${envData.gmail_app_password ? '변경하려면 새 비밀번호 입력' : 'abcdefghijklmnop'}">
+          </div>
+        </div>
+        <button class="btn btn-primary" onclick="saveAppPassword()">💾 저장 및 연결 테스트</button>
+      </div>
+    </div>
+
+    <div id="gmail-oauth" class="tab-content hidden">
       <div class="card">
         <div class="card-title">🔑 Google OAuth 인증</div>
         <div style="font-size:13px;color:var(--text-muted);margin-bottom:16px;line-height:1.8;">
@@ -1169,55 +1378,88 @@ async function renderGmailConfig() {
         <div id="oauth-result" style="margin-top:16px;"></div>
       </div>
     </div>
-    
-    <div id="gmail-apppass" class="tab-content hidden">
-      <div class="card">
-        <div class="card-title">🔑 App Password 설정 (SMTP/IMAP)</div>
-        <div style="font-size:13px;color:var(--text-muted);margin-bottom:16px;line-height:1.8;">
-          Gmail 계정에서 2단계 인증 활성화 후 앱 비밀번호를 생성하세요.
-        </div>
-        <div class="form-row">
-          <div class="form-group">
-            <label class="form-label">Gmail 계정</label>
-            <input class="form-input" id="ap-email" type="email" placeholder="your@gmail.com" value="${envData.gmail_user || ''}">
-          </div>
-          <div class="form-group">
-            <label class="form-label">앱 비밀번호</label>
-            <input class="form-input" id="ap-password" type="password" placeholder="16자리 앱 비밀번호">
-          </div>
-        </div>
-        <button class="btn btn-primary" onclick="saveAppPassword()">💾 저장</button>
-      </div>
-    </div>
-    
+
     <div id="gmail-fetch" class="tab-content hidden">
       <div class="card">
         <div class="card-title">⚙️ 메일 수집 설정</div>
+        ${fetchMailboxHtml}
         <div class="form-group">
-          <label class="form-label">수집할 메일함 (레이블)</label>
-          <select class="form-select" id="fetch-label" multiple style="height:120px;">
-            ${labelOptions}
-          </select>
-        </div>
-        <div class="form-group">
-          <label class="form-label">Gmail 검색 쿼리 (예: subject:alert OR subject:security)</label>
-          <input class="form-input" id="fetch-query" placeholder="subject:security OR subject:alert" value="${envData.gmail_query || ''}">
+          <label class="form-label">Gmail 검색 쿼리</label>
+          <input class="form-input" id="fetch-query" placeholder="subject:security OR subject:alert OR subject:warning" value="${envData.gmail_query || ''}">
+          <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">비워두면 전체 수신함 수집</div>
         </div>
         <div class="form-row">
           <div class="form-group">
             <label class="form-label">최대 수집 건수</label>
-            <input class="form-input" id="fetch-max" type="number" value="50" min="1" max="200">
+            <input class="form-input" id="fetch-max" type="number" value="${envData.gmail_max_results || 50}" min="1" max="200">
           </div>
           <div class="form-group">
-            <label class="form-label">수집 기간 (YYYY/MM/DD)</label>
-            <input class="form-input" id="fetch-after" placeholder="2024/01/01">
+            <label class="form-label">수집 기준일 (YYYY/MM/DD)</label>
+            <input class="form-input" id="fetch-after" placeholder="2024/01/01" value="${envData.gmail_after_date || ''}">
           </div>
         </div>
-        <button class="btn btn-primary" onclick="fetchEmails()">📥 지금 수집</button>
-        <button class="btn btn-secondary" style="margin-left:8px;" onclick="saveFetchSettings()">💾 설정 저장</button>
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label">자동 수집 주기 (분, 0=비활성)</label>
+            <input class="form-input" id="fetch-interval" type="number" value="${envData.fetch_interval_minutes || 0}" min="0" max="1440" step="10"
+              placeholder="0">
+            <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
+              ⚡ 10분 이상 설정 시 자동 수집 활성화 · 0 입력 시 매일 09:00 1회만 수집
+            </div>
+          </div>
+          <div class="form-group" style="align-self:flex-end;">
+            <div id="scheduler-status-badge" style="font-size:13px;color:var(--text-muted);">스케줄 확인 중...</div>
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <button class="btn btn-primary" onclick="fetchEmails()">📥 지금 수집</button>
+          <button class="btn btn-warning" onclick="analyzeAllPending()">🤖 미분석 전체 분석</button>
+          <button class="btn btn-secondary" onclick="saveFetchSettings()">💾 설정 저장</button>
+        </div>
       </div>
     </div>
   `;
+  // 스케줄러 상태 로드
+  loadSchedulerStatus();
+}
+
+async function loadSchedulerStatus() {
+  const badge = document.getElementById('scheduler-status-badge');
+  if (!badge) return;
+  const data = await api('/api/settings/scheduler-status');
+  if (data.error) { badge.textContent = '스케줄 상태 조회 실패'; return; }
+  const interval = data.fetch_interval_minutes || 0;
+  const periodicJob = (data.jobs || []).find(j => j.id === 'periodic_fetch');
+  if (interval >= 10 && periodicJob) {
+    const next = periodicJob.next_run ? new Date(periodicJob.next_run).toLocaleString('ko-KR') : '-';
+    badge.innerHTML = `<span style="color:var(--accent-green);">✅ 자동 수집 활성 (${interval}분 간격)</span><br><span style="font-size:11px;color:var(--text-muted);">다음 실행: ${next}</span>`;
+  } else {
+    badge.innerHTML = `<span style="color:var(--text-muted);">⏸ 자동 수집 비활성 (매일 09:00 1회)</span>`;
+  }
+}
+
+async function loadImapMailboxes() {
+  const listDiv = document.getElementById('imap-mailbox-list');
+  if (!listDiv) return;
+  listDiv.innerHTML = '<span style="color:var(--text-muted);font-size:13px;">📂 폴더 목록 불러오는 중...</span>';
+
+  const res = await api('/api/gmail/mailboxes');
+  if (!res.success && !res.mailboxes?.length) {
+    const common = res.common || ['INBOX', '[Gmail]/All Mail', '[Gmail]/Spam', '[Gmail]/Sent Mail'];
+    listDiv.innerHTML = `
+      <div style="font-size:13px;color:var(--critical);margin-bottom:6px;">⚠️ 폴더 목록 조회 실패 (App Password 설정 후 재시도): ${res.error || ''}</div>
+      <div style="font-size:12px;color:var(--text-muted);">자주 쓰는 폴더:</div>
+      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;">
+        ${common.map(m => `<button class="btn btn-secondary" style="font-size:12px;padding:4px 10px;" onclick="document.getElementById('fetch-mailbox').value='${m}'">${m}</button>`).join('')}
+      </div>`;
+    return;
+  }
+  const mailboxes = res.mailboxes?.length ? res.mailboxes : (res.common || []);
+  listDiv.innerHTML = `
+    <div style="font-size:12px;color:var(--text-muted);margin-bottom:6px;">클릭하면 선택됩니다:</div>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;">
+      ${mailboxes.map(m => `<button class="btn btn-secondary" style="font-size:12px;padding:4px 10px;" onclick="document.getElementById('fetch-mailbox').value='${m}'">${m}</button>`).join('')}
+    </div>`;
 }
 
 function switchTab(contentId, tabEl) {
@@ -1272,26 +1514,72 @@ async function completeOAuth(secretB64) {
 
 async function saveAppPassword() {
   const email = document.getElementById('ap-email')?.value?.trim();
-  const password = document.getElementById('ap-password')?.value;
-  
-  const result = await api('/api/settings/env', 'POST', {
+  const password = document.getElementById('ap-password')?.value?.trim();
+
+  if (!email) {
+    showToast('Gmail 계정 이메일을 입력해주세요.', 'error');
+    return;
+  }
+  if (!password) {
+    showToast('앱 비밀번호를 입력해주세요. (공백 없이 16자리)', 'error');
+    return;
+  }
+
+  // 앱 비밀번호 공백 제거 (Google이 보여주는 형식: "abcd efgh ijkl mnop")
+  const cleanPassword = password.replace(/\s/g, '');
+  if (cleanPassword.length < 8) {
+    showToast('앱 비밀번호가 너무 짧습니다. 16자리를 입력해주세요.', 'error');
+    return;
+  }
+
+  showToast('🔄 IMAP 연결 테스트 중...', 'info');
+
+  const result = await api('/api/gmail/app-password/save', 'POST', {
     gmail_user: email,
-    gmail_app_password: password,
-    smtp_user: email,
-    smtp_password: password,
-    smtp_host: 'smtp.gmail.com',
-    smtp_port: 587,
+    gmail_app_password: cleanPassword,
   });
-  
+
   if (result.success) {
-    showToast('✅ App Password 저장 완료', 'success');
+    showToast('✅ App Password 저장 완료! ' + (result.message || ''), 'success');
+    setTimeout(() => renderGmailConfig(), 800);
+  } else {
+    const errMsg = result.error || result.message || '저장 실패';
+    showToast('❌ ' + errMsg, 'error');
+    // 실패해도 이메일은 화면에 유지
   }
 }
 
 async function saveFetchSettings() {
   const query = document.getElementById('fetch-query')?.value?.trim();
-  const result = await api('/api/settings/env', 'POST', { gmail_query: query });
-  if (result.success) showToast('✅ 수집 설정 저장 완료', 'success');
+  const maxResults = document.getElementById('fetch-max')?.value?.trim();
+  const afterDate = document.getElementById('fetch-after')?.value?.trim();
+  const intervalVal = document.getElementById('fetch-interval')?.value?.trim();
+  // IMAP 모드: text input / OAuth 모드: select (multiple)
+  const mailboxInput = document.getElementById('fetch-mailbox');
+  const labelSelect = document.getElementById('fetch-label');
+
+  const payload = {};
+  if (query !== undefined) payload.gmail_query = query;
+  if (maxResults) payload.gmail_max_results = maxResults;
+  if (afterDate !== undefined) payload.gmail_after_date = afterDate;
+  if (intervalVal !== undefined) payload.fetch_interval_minutes = intervalVal;
+
+  if (mailboxInput) {
+    const mailbox = mailboxInput.value.trim();
+    if (mailbox) payload.gmail_mailbox = mailbox;
+  } else if (labelSelect) {
+    const selectedLabels = Array.from(labelSelect.selectedOptions).map(o => o.value);
+    payload.gmail_label_ids = selectedLabels;
+  }
+
+  const result = await api('/api/settings/env', 'POST', payload);
+  if (result.success) {
+    showToast('✅ 수집 설정 저장 완료', 'success');
+    // 스케줄러 상태 갱신
+    setTimeout(() => loadSchedulerStatus(), 500);
+  } else {
+    showToast('❌ 저장 실패: ' + (result.detail || result.message || ''), 'error');
+  }
 }
 
 // ============================================================
@@ -1443,17 +1731,45 @@ async function renderSettings() {
   const envData = await api('/api/settings/env');
   const llmStatus = await api('/api/llm/status');
   const llmModels = await api('/api/llm/models');
+  const sysInfo = await api('/api/settings/system-info');
   
-  const modelOptions = (llmModels.models || []).map(m => `<option value="${m}">${m}</option>`).join('');
+  const modelOptions = (llmModels.models || []).map(m => `<option value="${m}" ${m.includes('gemma3') ? 'selected' : ''}>${m}</option>`).join('');
+  const currentModel = envData.ollama_model || 'gemma3:4b';
   
   document.getElementById('page-content').innerHTML = `
+    <!-- 시스템 현황 -->
+    <div class="card" style="margin-bottom:16px;">
+      <div class="card-title">🖥️ 시스템 현황</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;">
+        <div style="background:var(--bg-primary);border:1px solid var(--border);border-radius:8px;padding:12px;">
+          <div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">🤖 LLM 모델</div>
+          <div style="font-size:13px;font-weight:600;color:var(--accent-cyan);">${sysInfo.ollama_model || currentModel}</div>
+          <div style="font-size:10px;color:${llmStatus.connected ? 'var(--accent-green)' : 'var(--critical)'};">${llmStatus.connected ? '● 연결됨' : '● 연결 안됨'}</div>
+        </div>
+        <div style="background:var(--bg-primary);border:1px solid var(--border);border-radius:8px;padding:12px;">
+          <div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">🗄️ 데이터베이스</div>
+          <div style="font-size:13px;font-weight:600;color:var(--accent-blue);">${sysInfo.db_type || 'SQLite'}</div>
+          <div style="font-size:10px;color:var(--text-muted);">${sysInfo.db_host || 'local'}</div>
+        </div>
+        <div style="background:var(--bg-primary);border:1px solid var(--border);border-radius:8px;padding:12px;">
+          <div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">🖥️ GPU</div>
+          <div style="font-size:12px;font-weight:600;color:var(--accent-green);">${(sysInfo.gpu || 'N/A').split(',')[0]}</div>
+        </div>
+        <div style="background:var(--bg-primary);border:1px solid var(--border);border-radius:8px;padding:12px;">
+          <div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">🌐 서비스 포트</div>
+          <div style="font-size:13px;font-weight:600;color:var(--accent-yellow);">Frontend: ${sysInfo.frontend_port || 61001}</div>
+          <div style="font-size:10px;color:var(--text-muted);">API: ${sysInfo.api_port || 8000}</div>
+        </div>
+      </div>
+    </div>
+
     <div class="grid-2">
       <!-- LLM 설정 -->
       <div class="card">
-        <div class="card-title">🤖 로컬 LLM (Ollama) 설정</div>
+        <div class="card-title">🤖 로컬 LLM (Gemma4/Ollama) 설정</div>
         <div style="margin-bottom:12px;padding:10px;border-radius:6px;background:${llmStatus.connected ? 'rgba(6,214,160,0.1)' : 'rgba(239,35,60,0.1)'};border:1px solid ${llmStatus.connected ? 'rgba(6,214,160,0.3)' : 'rgba(239,35,60,0.3)'};">
           <div style="color:${llmStatus.connected ? 'var(--accent-green)' : 'var(--critical)'};">
-            ${llmStatus.connected ? '✅ 연결됨' : '❌ 연결 안됨'}
+            ${llmStatus.connected ? '✅ Ollama 연결됨' : '❌ Ollama 연결 안됨'}
           </div>
           <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">${llmStatus.message || llmStatus.error || ''}</div>
         </div>
@@ -1462,13 +1778,13 @@ async function renderSettings() {
           <input class="form-input" id="llm-url" value="${envData.ollama_url || 'http://localhost:11434'}">
         </div>
         <div class="form-group">
-          <label class="form-label">기본 모델</label>
+          <label class="form-label">기본 모델 (권장: gemma3:4b)</label>
           <select class="form-select" id="llm-model">
-            <option value="llama3.2:3b">llama3.2:3b (추천 - 소형)</option>
-            <option value="llama3.1:8b">llama3.1:8b</option>
-            <option value="mistral:7b">mistral:7b</option>
-            <option value="qwen2.5:7b">qwen2.5:7b (한국어 우수)</option>
-            <option value="gemma3:9b">gemma3:9b</option>
+            <option value="gemma3:4b" ${currentModel === 'gemma3:4b' ? 'selected' : ''}>gemma3:4b ⭐ (NVIDIA GB10 최적화)</option>
+            <option value="gemma3:12b" ${currentModel === 'gemma3:12b' ? 'selected' : ''}>gemma3:12b (고성능)</option>
+            <option value="llama3.2:3b" ${currentModel === 'llama3.2:3b' ? 'selected' : ''}>llama3.2:3b (소형)</option>
+            <option value="llama3.1:8b" ${currentModel === 'llama3.1:8b' ? 'selected' : ''}>llama3.1:8b</option>
+            <option value="qwen2.5:7b" ${currentModel === 'qwen2.5:7b' ? 'selected' : ''}>qwen2.5:7b (한국어 우수)</option>
             ${modelOptions}
           </select>
         </div>
@@ -1506,10 +1822,15 @@ async function renderSettings() {
     <div id="model-pull-section" class="card hidden">
       <div class="card-title">📥 Ollama 모델 다운로드</div>
       <div style="font-size:13px;color:var(--text-muted);margin-bottom:12px;">
-        NVIDIA GB10 GPU로 가속됩니다. 권장 모델: llama3.2:3b (소형), qwen2.5:7b (한국어)
+        NVIDIA GB10 GPU로 가속됩니다. 🌟 권장: gemma3:4b (Google Gemma4 - 분석 최적화)
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin-bottom:12px;">
+        ${['gemma3:4b', 'gemma3:12b', 'llama3.2:3b', 'qwen2.5:7b'].map(m => 
+          `<button class="btn btn-secondary btn-sm" onclick="document.getElementById('pull-model-name').value='${m}'">📌 ${m}</button>`
+        ).join('')}
       </div>
       <div style="display:flex;gap:8px;margin-bottom:12px;">
-        <input class="form-input" id="pull-model-name" placeholder="모델명 (예: llama3.2:3b)" value="llama3.2:3b">
+        <input class="form-input" id="pull-model-name" placeholder="모델명 (예: gemma3:4b)" value="gemma3:4b">
         <button class="btn btn-primary" onclick="pullModel()">📥 다운로드</button>
       </div>
       <div id="pull-progress" style="display:none;">
@@ -1519,7 +1840,98 @@ async function renderSettings() {
         <div id="pull-status" style="font-size:12px;color:var(--text-muted);"></div>
       </div>
     </div>
+
+    <!-- 시간대 및 스케줄 설정 -->
+    <div class="card">
+      <div class="card-title">🕐 시간대 및 업무시간 설정</div>
+
+      <!-- 시간대 정보 패널 -->
+      <div style="background:rgba(67,97,238,0.08);border:1px solid rgba(67,97,238,0.3);border-radius:8px;padding:12px 14px;margin-bottom:16px;">
+        <div style="font-size:12px;font-weight:600;color:var(--accent-blue);margin-bottom:8px;">ℹ️ 시간대 동작 방식</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;font-size:12px;color:var(--text-secondary);">
+          <div>
+            <div style="color:var(--text-muted);margin-bottom:3px;">📦 DB 저장 방식</div>
+            <div style="font-weight:600;color:var(--accent-cyan);">UTC (협정세계시) 기준 저장</div>
+            <div style="font-size:11px;margin-top:2px;">수집된 이메일 날짜를 UTC로 통일 저장</div>
+          </div>
+          <div>
+            <div style="color:var(--text-muted);margin-bottom:3px;">🖥️ 화면 표시 방식</div>
+            <div style="font-weight:600;color:var(--accent-green);">설정된 시간대로 자동 변환 표시</div>
+            <div style="font-size:11px;margin-top:2px;">UTC → 설정 시간대로 변환하여 표시</div>
+          </div>
+          <div>
+            <div style="color:var(--text-muted);margin-bottom:3px;">🌙 야간/시간외 판단</div>
+            <div style="font-weight:600;color:var(--accent-yellow);">설정 시간대 기준으로 판단</div>
+            <div style="font-size:11px;margin-top:2px;">업무시간 외 알람에 🌙 표시</div>
+          </div>
+          <div>
+            <div style="color:var(--text-muted);margin-bottom:3px;">⏰ 현재 시각</div>
+            <div id="tz-live-clock" style="font-weight:600;color:var(--accent-cyan);font-family:monospace;">--:--:--</div>
+            <div style="font-size:11px;margin-top:2px;">현재 적용 시간대: <strong>${envData.app_timezone || 'Asia/Seoul'}</strong></div>
+          </div>
+        </div>
+      </div>
+
+      <div style="font-size:13px;color:var(--text-muted);margin-bottom:14px;">
+        시간대 설정은 <strong>알람 수신시간 표시</strong>, <strong>야간 업무외 판단</strong>, <strong>자동 수집·리포트 스케줄</strong>에 모두 적용됩니다.
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">표시 시간대 (IANA timezone)</label>
+          <select class="form-select" id="app-timezone" onchange="updateTzPreview()">
+            ${[
+              'Asia/Seoul', 'Asia/Tokyo', 'Asia/Singapore', 'Asia/Shanghai',
+              'Asia/Bangkok', 'Asia/Kolkata', 'Europe/London', 'Europe/Berlin',
+              'Europe/Paris', 'America/New_York', 'America/Chicago',
+              'America/Los_Angeles', 'America/Sao_Paulo', 'UTC'
+            ].map(tz => `<option value="${tz}" ${envData.app_timezone === tz ? 'selected' : ''}>${tz}</option>`).join('')}
+          </select>
+          <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">현재 적용: <strong style="color:var(--accent-cyan);">${envData.app_timezone || 'Asia/Seoul'}</strong></div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">업무 시작 시간 (0~23시)</label>
+          <input class="form-input" id="biz-start" type="number" min="0" max="23" value="${envData.business_start_hour ?? 9}" oninput="updateBizHoursPreview()">
+        </div>
+        <div class="form-group">
+          <label class="form-label">업무 종료 시간 (0~23시)</label>
+          <input class="form-input" id="biz-end" type="number" min="0" max="23" value="${envData.business_end_hour ?? 18}" oninput="updateBizHoursPreview()">
+        </div>
+      </div>
+
+      <!-- 야간 대응 미리보기 -->
+      <div id="biz-hours-preview" style="background:var(--bg-primary);border:1px solid var(--border);border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:12px;">
+        <div style="font-weight:600;color:var(--text-muted);margin-bottom:6px;">🌙 야간/시간외 판단 기준 미리보기</div>
+        <div id="biz-hours-detail" style="color:var(--text-secondary);line-height:1.8;"></div>
+      </div>
+
+      <div class="form-row" style="margin-top:8px;">
+        <div class="form-group">
+          <label class="form-label">일일 수집 시각 (시)</label>
+          <input class="form-input" id="fetch-hour" type="number" min="0" max="23" value="${envData.daily_fetch_hour ?? 9}">
+        </div>
+        <div class="form-group">
+          <label class="form-label">일일 수집 시각 (분)</label>
+          <input class="form-input" id="fetch-minute" type="number" min="0" max="59" value="${envData.daily_fetch_minute ?? 0}">
+        </div>
+        <div class="form-group">
+          <label class="form-label">일일 리포트 시각 (시)</label>
+          <input class="form-input" id="report-hour" type="number" min="0" max="23" value="${envData.daily_report_hour ?? 9}">
+        </div>
+        <div class="form-group">
+          <label class="form-label">일일 리포트 시각 (분)</label>
+          <input class="form-input" id="report-minute" type="number" min="0" max="59" value="${envData.daily_report_minute ?? 30}">
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;align-items:center;">
+        <button class="btn btn-primary" onclick="saveTimezoneSettings()">💾 시간대 설정 저장</button>
+        <div id="tz-scheduler-status" style="font-size:13px;color:var(--text-muted);"></div>
+      </div>
+    </div>
   `;
+
+  // 라이브 시계 시작 및 업무시간 미리보기 초기화
+  _startTzClock();
+  updateBizHoursPreview();
 }
 
 async function saveLLMSettings() {
@@ -1528,6 +1940,109 @@ async function saveLLMSettings() {
     ollama_model: document.getElementById('llm-model')?.value,
   });
   if (result.success) showToast('✅ LLM 설정 저장 완료', 'success');
+}
+
+async function saveTimezoneSettings() {
+  const tz       = document.getElementById('app-timezone')?.value;
+  const bizStart = document.getElementById('biz-start')?.value;
+  const bizEnd   = document.getElementById('biz-end')?.value;
+  const fetchH   = document.getElementById('fetch-hour')?.value;
+  const fetchM   = document.getElementById('fetch-minute')?.value;
+  const reportH  = document.getElementById('report-hour')?.value;
+  const reportM  = document.getElementById('report-minute')?.value;
+
+  const payload = {};
+  if (tz)       payload.app_timezone        = tz;
+  if (bizStart) payload.business_start_hour = bizStart;
+  if (bizEnd)   payload.business_end_hour   = bizEnd;
+  if (fetchH)   payload.daily_fetch_hour    = fetchH;
+  if (fetchM !== undefined) payload.daily_fetch_minute  = fetchM;
+  if (reportH)  payload.daily_report_hour   = reportH;
+  if (reportM !== undefined) payload.daily_report_minute = reportM;
+
+  const result = await api('/api/settings/env', 'POST', payload);
+  if (result.success) {
+    // 프론트엔드 시간대 즉시 갱신
+    if (tz) _appTimezone = tz;
+    if (bizStart) _businessStartHour = parseInt(bizStart);
+    if (bizEnd)   _businessEndHour   = parseInt(bizEnd);
+    showToast('✅ 시간대 설정 저장 완료 (스케줄 자동 재적용)', 'success');
+    // 스케줄러 상태 갱신
+    setTimeout(async () => {
+      const schedData = await api('/api/settings/scheduler-status');
+      const tzDiv = document.getElementById('tz-scheduler-status');
+      if (tzDiv && schedData.jobs) {
+        const jobList = schedData.jobs.map(j =>
+          `<div>📅 ${j.name}: ${j.next_run ? new Date(j.next_run).toLocaleString('ko-KR', {timeZone: _appTimezone}) : '-'}</div>`
+        ).join('');
+        tzDiv.innerHTML = `<div style="font-size:12px;line-height:1.8;">${jobList}</div>`;
+      }
+    }, 800);
+  } else {
+    showToast('❌ 저장 실패: ' + (result.detail || result.message || ''), 'error');
+  }
+}
+
+// ============================================================
+// 시간대 설정 헬퍼
+// ============================================================
+function _startTzClock() {
+  // 기존 타이머 제거
+  if (_tzClockTimer) clearInterval(_tzClockTimer);
+  function _tick() {
+    const el = document.getElementById('tz-live-clock');
+    if (!el) { clearInterval(_tzClockTimer); _tzClockTimer = null; return; }
+    const tz = document.getElementById('app-timezone')?.value || _appTimezone;
+    el.textContent = new Date().toLocaleTimeString('ko-KR', { timeZone: tz, hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+  }
+  _tick();
+  _tzClockTimer = setInterval(_tick, 1000);
+}
+
+function updateTzPreview() {
+  // 시간대 변경 시 라이브 시계 갱신 (타이머는 이미 실행 중)
+  updateBizHoursPreview();
+}
+
+function updateBizHoursPreview() {
+  const el = document.getElementById('biz-hours-detail');
+  if (!el) return;
+  const tz = document.getElementById('app-timezone')?.value || _appTimezone;
+  const startH = parseInt(document.getElementById('biz-start')?.value ?? 9);
+  const endH   = parseInt(document.getElementById('biz-end')?.value ?? 18);
+  if (isNaN(startH) || isNaN(endH)) return;
+
+  const now = new Date();
+  const nowLocal = new Date(now.toLocaleString('en-US', { timeZone: tz }));
+  const curHour = nowLocal.getHours();
+  const curMin  = nowLocal.getMinutes();
+  const weekday = nowLocal.getDay(); // 0=일, 1=월 ... 6=토
+  const isWeekend = weekday === 0 || weekday === 6;
+  const isOutside = !(startH <= curHour && curHour < endH);
+  const isAfterHours = isWeekend || isOutside;
+
+  const dayNames = ['일','월','화','수','목','금','토'];
+  const currentTimeStr = `${String(curHour).padStart(2,'0')}:${String(curMin).padStart(2,'0')} (${dayNames[weekday]}요일)`;
+
+  el.innerHTML = `
+    <div style="display:flex;gap:16px;flex-wrap:wrap;">
+      <div>
+        <span style="color:var(--accent-green);">✅ 업무시간</span>: 
+        <strong>${String(startH).padStart(2,'0')}:00 ~ ${String(endH).padStart(2,'0')}:00</strong> (평일, ${tz})
+      </div>
+      <div>
+        <span style="color:var(--high);">🌙 야간/시간외</span>: 
+        <strong>${String(endH).padStart(2,'0')}:00 ~ ${String(startH).padStart(2,'0')}:00 (다음날)</strong> + 주말
+      </div>
+    </div>
+    <div style="margin-top:6px;">
+      현재 ${tz} 시각: <strong style="color:var(--accent-cyan);">${currentTimeStr}</strong>
+      → 
+      ${isAfterHours
+        ? `<span style="color:#ffa500;font-weight:600;">🌙 야간/시간외</span>${isWeekend ? ' (주말)' : ' (업무시간 외)'} — 이 시각 발생 알람은 <span style="background:rgba(255,140,0,0.2);color:#ffa500;padding:1px 5px;border-radius:4px;font-size:11px;">🌙야간</span> 태그가 붙습니다`
+        : `<span style="color:var(--accent-green);font-weight:600;">✅ 업무시간 내</span> — 이 시각 발생 알람은 정상 처리됩니다`
+      }
+    </div>`;
 }
 
 async function saveAPIKeys() {
@@ -1605,29 +2120,316 @@ async function pullModel() {
 // ============================================================
 // 메일 수집
 // ============================================================
+async function analyzeAllPending() {
+  showToast('🤖 미분석 알람 전체 분석 시작...', 'info');
+  const result = await api('/api/settings/analyze-pending', 'POST', { limit: 200 });
+  if (result.success) {
+    showToast(`🤖 ${result.queued}개 알람 분석 진행 중 (백그라운드)`, 'success');
+  } else {
+    showToast('❌ 분석 실패: ' + (result.detail || result.message || ''), 'error');
+  }
+}
+
+function resetAlertFilters() {
+  _alertFilter.severity = '';
+  _alertFilter.status   = '';
+  _alertFilter.fp       = '';
+  _alertFilter.search   = '';
+  _alertFilter.days     = '30';
+  // DOM 반영
+  const s = document.getElementById('filter-severity');
+  const st = document.getElementById('filter-status');
+  const fp = document.getElementById('filter-fp');
+  const sr = document.getElementById('filter-search');
+  const dy = document.getElementById('filter-days');
+  if (s)  s.value  = '';
+  if (st) st.value = '';
+  if (fp) fp.value = '';
+  if (sr) sr.value = '';
+  if (dy) dy.value = '30';
+  renderAlerts(1);
+}
+
+// ============================================================
+// 상관분석 (2차 침해·횡전개 분석)
+// ============================================================
+function showCorrelationModal() {
+  openModal(`
+    <div class="modal-header">
+      <div class="modal-title">🕸 보안 알람 상관분석</div>
+      <button class="modal-close" onclick="closeModal()">×</button>
+    </div>
+
+    <!-- 사용 방법 안내 -->
+    <div style="background:rgba(6,214,160,0.06);border:1px solid rgba(6,214,160,0.2);border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:12px;color:var(--text-secondary);">
+      <div style="font-weight:600;color:var(--accent-green);margin-bottom:6px;">📖 상관분석 사용 방법</div>
+      <ol style="margin:0 0 0 16px;line-height:2;">
+        <li><strong>분석 기간</strong>과 <strong>분석 대상</strong>을 선택하세요</li>
+        <li><strong>🔍 상관분석 시작</strong> 버튼을 클릭하세요</li>
+        <li>LLM이 알람 패턴을 분석합니다 (보통 1~3분 소요)</li>
+        <li>분석 중에도 모달을 닫고 다른 작업이 가능합니다<br>
+          <span style="color:var(--accent-cyan);">→ 알람 목록 상단의 상태바에서 진행 상태와 결과 요약을 확인할 수 있습니다</span></li>
+      </ol>
+    </div>
+
+    ${_corrStatus.running ? \`
+    <div style="padding:10px 14px;background:rgba(67,97,238,0.1);border:1px solid rgba(67,97,238,0.3);border-radius:8px;margin-bottom:14px;display:flex;align-items:center;gap:10px;">
+      <div class="spinner" style="width:16px;height:16px;border-width:2px;"></div>
+      <span style="color:var(--accent-cyan);font-weight:600;">상관분석이 진행 중입니다. 잠시 기다려주세요...</span>
+    </div>\` : ''}
+
+    <div class="form-row">
+      <div class="form-group">
+        <label class="form-label">분석 기간</label>
+        <select class="form-select" id="corr-days" ${_corrStatus.running ? 'disabled' : ''}>
+          <option value="1">오늘 (1일)</option>
+          <option value="3">최근 3일</option>
+          <option value="7" selected>최근 7일</option>
+          <option value="30">최근 30일</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label class="form-label">분석 대상</label>
+        <select class="form-select" id="corr-target" ${_corrStatus.running ? 'disabled' : ''}>
+          <option value="analyzed">분석완료 알람만</option>
+          <option value="all">전체 알람</option>
+        </select>
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:16px;align-items:center;">
+      <button class="btn btn-primary" onclick="runCorrelation()" ${_corrStatus.running ? 'disabled' : ''}>
+        ${_corrStatus.running ? '⏳ 분석 중...' : '🔍 상관분석 시작'}
+      </button>
+      <span style="font-size:12px;color:var(--text-muted);">LLM 분석이므로 1~3분 소요됩니다</span>
+    </div>
+    <div id="corr-result"></div>
+  `);
+}
+
+async function runCorrelation() {
+  const days = parseInt(document.getElementById('corr-days')?.value || 7);
+  const target = document.getElementById('corr-target')?.value || 'analyzed';
+  const resultDiv = document.getElementById('corr-result');
+  if (!resultDiv) return;
+
+  // 전역 상태: 진행 중으로 설정 (알람 목록 페이지 상태바 업데이트)
+  _corrStatus = { running: true, lastResult: null };
+  _updateCorrStatusBar();
+
+  // 진행 상황 UI: 단계별 애니메이션
+  const steps = ['📊 알람 수집 중...', '🔍 IP/패턴 분석 중...', '🤖 AI 상관관계 추론 중...', '📋 결과 정리 중...'];
+  let stepIdx = 0;
+  resultDiv.innerHTML = `
+    <div style="padding:20px;background:var(--bg-primary);border-radius:10px;border:1px solid var(--border);">
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;">
+        <div class="spinner" style="width:24px;height:24px;border-width:3px;"></div>
+        <div>
+          <div id="corr-step-label" style="font-size:14px;font-weight:600;color:var(--text-primary);">${steps[0]}</div>
+          <div style="font-size:12px;color:var(--text-muted);margin-top:2px;">LLM 분석이므로 1~2분 소요됩니다</div>
+        </div>
+      </div>
+      <div class="progress-bar" style="height:6px;margin-bottom:12px;">
+        <div class="progress-fill" id="corr-progress-bar" style="width:5%;transition:width 0.5s ease;"></div>
+      </div>
+      <div id="corr-step-detail" style="font-size:12px;color:var(--text-muted);line-height:1.6;">
+        ${steps.map((s,i) => `<div id="corr-s${i}" style="color:${i===0?'var(--accent-cyan)':'var(--text-muted)'}">
+          ${i===0?'🔄':'⏳'} ${s}</div>`).join('')}
+      </div>
+    </div>`;
+
+  if (_corrPollingTimer) clearInterval(_corrPollingTimer);
+  let pct = 5;
+  _corrPollingTimer = setInterval(() => {
+    stepIdx = Math.min(stepIdx + 1, steps.length - 1);
+    pct = Math.min(pct + 20, 90);
+    const label = document.getElementById('corr-step-label');
+    const bar = document.getElementById('corr-progress-bar');
+    if (label) label.textContent = steps[stepIdx];
+    if (bar) bar.style.width = pct + '%';
+    // 이전 단계 완료 표시
+    for (let i = 0; i < steps.length; i++) {
+      const el = document.getElementById(`corr-s${i}`);
+      if (!el) continue;
+      if (i < stepIdx) el.style.color = 'var(--accent-green)';
+      else if (i === stepIdx) el.style.color = 'var(--accent-cyan)';
+    }
+  }, 22000);
+
+  // 분석 대상이 'all'이면 status 필터 없이 최근 알람 사용
+  let alert_ids = [];
+  if (target === 'all') {
+    // 최근 days일 알람 ID 조회
+    const params = new URLSearchParams({ days, limit: 30 });
+    const data = await api(`/api/alerts?${params}`);
+    alert_ids = (data.alerts || []).map(a => a.id);
+  }
+
+  const body = alert_ids.length ? { alert_ids, days } : { days };
+  const result = await api('/api/alerts/correlate', 'POST', body);
+
+  // 폴링 타이머 정리 및 진행바 100%
+  if (_corrPollingTimer) { clearInterval(_corrPollingTimer); _corrPollingTimer = null; }
+  const bar = document.getElementById('corr-progress-bar');
+  if (bar) bar.style.width = '100%';
+
+  // 전역 상태 초기화 (완료)
+  _corrStatus.running = false;
+
+  if (!result.success) {
+    _corrStatus.lastResult = null;
+    _updateCorrStatusBar();
+    resultDiv.innerHTML = `<div style="color:var(--critical);padding:12px;background:rgba(239,35,60,0.1);border-radius:8px;">⚠️ ${result.message || '분석 실패'}</div>`;
+    return;
+  }
+
+  const raw = result.correlation || {};
+  // LLM 응답이 다양한 형식으로 올 수 있으므로 방어적으로 추출
+  const analysis = raw.analysis || {};
+  const recs = raw.recommendations || {};
+  const c = {
+    overall_risk: (raw.overall_risk || raw.overall_risk_level || 'medium').toLowerCase(),
+    lateral_movement_detected: raw.lateral_movement_detected ?? false,
+    lateral_movement_evidence: raw.lateral_movement_evidence || '',
+    attack_campaign: raw.attack_campaign ?? false,
+    campaign_description: raw.campaign_description || '',
+    apt_indicators: raw.apt_indicators ?? false,
+    apt_description: raw.apt_description || '',
+    insider_threat_risk: raw.insider_threat_risk ?? false,
+    insider_description: raw.insider_description || '',
+    attack_timeline: raw.attack_timeline || '',
+    correlated_ips: raw.correlated_ips || raw.top_threat_ips || [],
+    // LLM이 nested analysis로 반환한 경우도 처리
+    key_findings: raw.key_findings || raw.attack_patterns ||
+      (analysis.threat_indicators || []).map(t => t.details || t.indicator || String(t)) ||
+      (analysis.potential_attack_scenarios || []),
+    priority_actions: raw.priority_actions || raw.recommendations ||
+      (recs.immediate_actions || []).concat(recs.long_term_hardening || []) || [],
+    risk_summary: raw.risk_summary || raw.threat_summary || analysis.summary || '',
+  };
+  const stats = result.statistics || {};
+
+  // 전역 상태: 결과 저장 → 알람 목록 상태바에 요약 표시
+  _corrStatus.lastResult = {
+    overall_risk: c.overall_risk,
+    lateral_movement_detected: c.lateral_movement_detected,
+    apt_indicators: c.apt_indicators,
+    attack_campaign: c.attack_campaign,
+    insider_threat_risk: c.insider_threat_risk,
+    risk_summary: c.risk_summary,
+    alert_count: result.alert_count,
+    period_days: result.period_days,
+  };
+  _updateCorrStatusBar();
+
+  // 위험도 색상
+  const riskColor = { critical: 'var(--critical)', high: 'var(--high)', medium: 'var(--medium)', low: 'var(--low)' };
+  const rc = riskColor[c.overall_risk] || 'var(--text-muted)';
+
+  const boolBadge = (val, trueLabel, falseLabel) =>
+    val ? `<span class="badge badge-critical">${trueLabel}</span>` : `<span class="badge badge-info">${falseLabel}</span>`;
+
+  const listHtml = (arr) => arr?.length
+    ? `<ul style="margin:6px 0 0 16px;font-size:13px;color:var(--text-secondary);">${arr.map(x => `<li>${escHtml(typeof x === 'object' ? JSON.stringify(x) : String(x))}</li>`).join('')}</ul>`
+    : '<span style="color:var(--text-muted);font-size:13px;">없음</span>';
+
+  resultDiv.innerHTML = `
+    <div style="background:var(--bg-primary);border:1px solid var(--border);border-radius:10px;padding:16px;">
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px;flex-wrap:wrap;">
+        <div style="font-size:22px;font-weight:700;color:${rc};">${(c.overall_risk || '?').toUpperCase()}</div>
+        <div style="font-size:13px;color:var(--text-muted);">분석 알람 ${result.alert_count}개 | 기간 ${result.period_days}일</div>
+        <div style="margin-left:auto;display:flex;gap:6px;flex-wrap:wrap;">
+          ${boolBadge(c.lateral_movement_detected, '⚠️ 횡전개 감지', '✅ 횡전개 미감지')}
+          ${boolBadge(c.apt_indicators, '🚨 APT 징후', '✅ APT 미감지')}
+          ${boolBadge(c.attack_campaign, '🎯 캠페인 감지', '✅ 단발성')}
+          ${boolBadge(c.insider_threat_risk, '👤 내부자 위협', '✅ 내부자 정상')}
+        </div>
+      </div>
+
+      ${c.risk_summary ? `
+      <div style="padding:10px 14px;background:rgba(255,200,0,0.07);border-left:3px solid ${rc};border-radius:4px;margin-bottom:12px;font-size:13px;color:var(--text-primary);">
+        📋 ${escHtml(c.risk_summary)}
+      </div>` : ''}
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;">
+        <div style="background:var(--bg-secondary);border-radius:8px;padding:12px;">
+          <div style="font-size:12px;font-weight:600;color:var(--text-muted);margin-bottom:6px;">📊 심각도 분포</div>
+          ${Object.entries(stats.severity_distribution || {}).map(([s,n]) =>
+            `<div style="display:flex;justify-content:space-between;font-size:12px;margin:2px 0;">
+              <span>${severityBadge(s)}</span><span style="color:var(--text-secondary);">${n}건</span>
+            </div>`).join('') || '<span style="color:var(--text-muted);font-size:12px;">없음</span>'}
+          <div style="margin-top:6px;font-size:12px;color:#ffa500;">🌙 야간 알람: ${stats.after_hours_alerts || 0}건</div>
+        </div>
+        <div style="background:var(--bg-secondary);border-radius:8px;padding:12px;">
+          <div style="font-size:12px;font-weight:600;color:var(--text-muted);margin-bottom:6px;">🌐 공통 IP</div>
+          ${(stats.shared_ips || []).length
+            ? (stats.shared_ips || []).map(ip => `<span class="ip-chip" onclick="lookupIP('${ip}')">${ip}</span>`).join(' ')
+            : '<span style="color:var(--text-muted);font-size:12px;">공통 IP 없음</span>'}
+          <div style="margin-top:6px;font-size:12px;color:var(--text-muted);">총 고유 IP: ${stats.total_unique_ips || 0}개</div>
+        </div>
+      </div>
+
+      ${c.lateral_movement_evidence ? `
+      <div style="margin-bottom:10px;">
+        <div style="font-size:13px;font-weight:600;color:var(--high);margin-bottom:4px;">⚠️ 횡전개 근거</div>
+        <div style="font-size:13px;color:var(--text-secondary);">${escHtml(c.lateral_movement_evidence)}</div>
+      </div>` : ''}
+
+      ${c.attack_timeline ? `
+      <div style="margin-bottom:10px;">
+        <div style="font-size:13px;font-weight:600;color:var(--accent-cyan);margin-bottom:4px;">🕒 공격 시나리오</div>
+        <div style="font-size:13px;color:var(--text-secondary);">${escHtml(c.attack_timeline)}</div>
+      </div>` : ''}
+
+      ${c.key_findings?.length ? `
+      <div style="margin-bottom:10px;">
+        <div style="font-size:13px;font-weight:600;color:var(--text-primary);margin-bottom:4px;">🔍 핵심 발견사항</div>
+        ${listHtml(c.key_findings)}
+      </div>` : ''}
+
+      ${c.priority_actions?.length ? `
+      <div>
+        <div style="font-size:13px;font-weight:600;color:var(--accent-green);margin-bottom:4px;">💡 즉각 조치사항</div>
+        ${listHtml(c.priority_actions)}
+      </div>` : ''}
+    </div>`;
+}
+
+// ============================================================
 async function fetchEmails() {
+  // IMAP 모드: text input / OAuth 모드: select (multiple)
+  const mailboxInput = document.getElementById('fetch-mailbox');
   const labelSelect = document.getElementById('fetch-label');
-  const labelIds = labelSelect ? Array.from(labelSelect.selectedOptions).map(o => o.value) : [];
+
+  let labelIds = [];
+  let mailbox = 'INBOX';
+
+  if (mailboxInput) {
+    mailbox = mailboxInput.value.trim() || 'INBOX';
+  } else if (labelSelect) {
+    labelIds = Array.from(labelSelect.selectedOptions).map(o => o.value);
+  }
+
   const query = document.getElementById('fetch-query')?.value || '';
   const maxResults = parseInt(document.getElementById('fetch-max')?.value || 50);
   const afterDate = document.getElementById('fetch-after')?.value || '';
-  
+
   showToast('📥 메일 수집 중...', 'info');
-  
+
   const result = await api('/api/gmail/fetch', 'POST', {
     label_ids: labelIds,
+    mailbox,
     query,
     max_results: maxResults,
     after_date: afterDate,
     auto_analyze: true,
   });
-  
+
   if (result.success) {
     showToast(`✅ ${result.saved}개 새 알람 수집 완료 (분석 중...)`, 'success');
     if (currentPage === 'dashboard') renderDashboard();
     else if (currentPage === 'alerts') renderAlerts(1);
   } else {
-    showToast('수집 실패: ' + result.detail, 'error');
+    showToast('❌ 수집 실패: ' + (result.detail || result.message || ''), 'error');
   }
 }
 
@@ -1647,6 +2449,46 @@ async function deleteAlert(alertId) {
   if (result.success) {
     showToast('✅ 삭제 완료', 'success');
     if (currentPage === 'alerts') renderAlerts(currentAlertPage);
+  }
+}
+
+// ============================================================
+// 상관분석 전역 상태 업데이트
+// ============================================================
+function _updateCorrStatusBar() {
+  const bar = document.getElementById('corr-status-bar');
+  const btn = document.getElementById('corr-btn');
+  if (!bar) return;
+  if (_corrStatus.running) {
+    bar.style.display = 'block';
+    bar.innerHTML = `<span style="display:inline-flex;align-items:center;gap:8px;">
+      <span class="spinner" style="width:14px;height:14px;border-width:2px;"></span>
+      <span style="color:var(--accent-cyan);font-weight:600;">🕸 상관분석 진행 중...</span>
+      <span style="color:var(--text-muted);">완료되면 결과가 여기에 표시됩니다</span>
+    </span>`;
+    if (btn) btn.disabled = true;
+  } else if (_corrStatus.lastResult) {
+    const r = _corrStatus.lastResult;
+    const riskColor = { critical: 'var(--critical)', high: 'var(--high)', medium: 'var(--medium)', low: 'var(--low)' };
+    const rc = riskColor[(r.overall_risk || '').toLowerCase()] || 'var(--text-muted)';
+    const flags = [
+      r.lateral_movement_detected ? '<span style="color:var(--high);">⚠️횡전개</span>' : null,
+      r.apt_indicators ? '<span style="color:var(--critical);">🚨APT</span>' : null,
+      r.attack_campaign ? '<span style="color:var(--high);">🎯캠페인</span>' : null,
+      r.insider_threat_risk ? '<span style="color:var(--medium);">👤내부자</span>' : null,
+    ].filter(Boolean).join(' ');
+    bar.style.display = 'block';
+    bar.innerHTML = `<span style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+      <span style="font-weight:700;color:${rc};">📊 상관분석 완료: ${(r.overall_risk || '?').toUpperCase()} 위험</span>
+      <span style="color:var(--text-muted);">알람 ${r.alert_count || '?'}개 · ${r.period_days || '?'}일</span>
+      ${flags}
+      ${r.risk_summary ? `<span style="color:var(--text-secondary);font-size:11px;">${escHtml(String(r.risk_summary).slice(0,100))}${r.risk_summary.length > 100 ? '…' : ''}</span>` : ''}
+      <button class="btn btn-secondary btn-sm" style="margin-left:auto;" onclick="showCorrelationModal()">🔍 상세보기</button>
+    </span>`;
+    if (btn) btn.disabled = false;
+  } else {
+    bar.style.display = 'none';
+    if (btn) btn.disabled = false;
   }
 }
 
@@ -1674,10 +2516,27 @@ function statusBadge(status) {
   return `<span class="badge ${cls}">${labels[status] || status || '신규'}</span>`;
 }
 
+async function loadAppTimezone() {
+  try {
+    const env = await api('/api/settings/env');
+    if (env.app_timezone) _appTimezone = env.app_timezone;
+    if (env.business_start_hour !== undefined) _businessStartHour = env.business_start_hour;
+    if (env.business_end_hour !== undefined) _businessEndHour = env.business_end_hour;
+  } catch(e) {}
+}
+
 function formatDate(dateStr) {
   if (!dateStr) return '-';
   try {
-    const d = new Date(dateStr);
+    // DB 저장값은 UTC naive (PostgreSQL timestamp without timezone)
+    // 'Z' suffix가 없으면 UTC로 명시적 처리
+    let isoStr = dateStr;
+    if (!isoStr.endsWith('Z') && !isoStr.includes('+') && !isoStr.includes('-', 11)) {
+      isoStr = isoStr + 'Z';  // UTC로 인식
+    }
+    const d = new Date(isoStr);
+    if (isNaN(d.getTime())) return dateStr;
+
     const now = new Date();
     const diff = now - d;
     
@@ -1685,10 +2544,31 @@ function formatDate(dateStr) {
     if (diff < 3600000) return Math.floor(diff / 60000) + '분 전';
     if (diff < 86400000) return Math.floor(diff / 3600000) + '시간 전';
     
-    return d.toLocaleDateString('ko-KR', { 
-      month: '2-digit', day: '2-digit', 
-      hour: '2-digit', minute: '2-digit' 
+    // 설정된 시간대로 변환하여 표시
+    return d.toLocaleString('ko-KR', {
+      timeZone: _appTimezone,
+      month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit',
+      hour12: false,
     });
+  } catch { return dateStr; }
+}
+
+function formatDateFull(dateStr) {
+  if (!dateStr) return '-';
+  try {
+    let isoStr = dateStr;
+    if (!isoStr.endsWith('Z') && !isoStr.includes('+') && !isoStr.includes('-', 11)) {
+      isoStr = isoStr + 'Z';
+    }
+    const d = new Date(isoStr);
+    if (isNaN(d.getTime())) return dateStr;
+    return d.toLocaleString('ko-KR', {
+      timeZone: _appTimezone,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+      hour12: false,
+    }) + ` (${_appTimezone})`;
   } catch { return dateStr; }
 }
 
@@ -1746,20 +2626,55 @@ async function checkLLMStatus() {
   const dot = document.getElementById('llm-status-dot');
   const text = document.getElementById('llm-status-text');
   
-  if (status.connected) {
-    dot.classList.remove('error', 'warning');
-    text.textContent = `LLM: ${(status.models || []).length}개 모델`;
-  } else {
-    dot.classList.add('warning');
-    text.textContent = 'LLM: 연결 안됨';
+  if (dot && text) {
+    if (status.connected) {
+      dot.className = 'status-dot';
+      dot.style.display = 'inline-block';
+      const modelName = (status.models || [])[0] || 'Gemma4';
+      text.textContent = `${modelName.split(':')[0]}`;
+    } else {
+      dot.className = 'status-dot warning';
+      dot.style.display = 'inline-block';
+      text.textContent = 'Gemma4: 연결 안됨';
+    }
+  }
+}
+
+async function checkDBStatus() {
+  const dot = document.getElementById('db-status-dot');
+  const text = document.getElementById('db-status-text');
+  const sysInfo = await api('/api/settings/system-info');
+  
+  if (dot && text) {
+    // health check로 DB 동작 간접 확인
+    const health = await api('/health');
+    if (health.status === 'healthy') {
+      dot.className = 'status-dot';
+      dot.style.display = 'inline-block';
+      text.textContent = `DB: ${sysInfo.db_type || 'SQLite'}`;
+    } else {
+      dot.className = 'status-dot error';
+      dot.style.display = 'inline-block';
+      text.textContent = 'DB: 오류';
+    }
+    // 시스템 정보 표시
+    const sysEl = document.getElementById('sys-info-text');
+    if (sysEl) {
+      sysEl.textContent = `UI:${sysInfo.frontend_port||61001} API:${sysInfo.api_port||8000}`;
+    }
   }
 }
 
 // 초기 렌더링
 window.addEventListener('DOMContentLoaded', async () => {
+  // 시간대 설정 먼저 로드 (formatDate에서 사용)
+  await loadAppTimezone();
+
   navigate('dashboard');
   checkLLMStatus();
+  checkDBStatus();
   
-  // 5분마다 LLM 상태 체크
+  // 5분마다 상태 체크
   setInterval(checkLLMStatus, 300000);
+  setInterval(checkDBStatus, 300000);
 });

@@ -1,0 +1,141 @@
+name: secmail
+
+# ============================================================
+# Security Mail Analyzer - CPU 전용 fallback
+# NVIDIA Container Runtime 미설치 환경용
+# 사용: sudo docker compose -f docker-compose.no-gpu.yml up -d --build
+# ============================================================
+
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: secmail_postgres
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB:-secmail}
+      POSTGRES_USER:     ${POSTGRES_USER:-secmail}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secmail_pass_2024}
+      PGDATA:            /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-secmail} -d ${POSTGRES_DB:-secmail}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # CPU 전용 Ollama (runtime: nvidia 없음)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: secmail_ollama
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+      - OLLAMA_NUM_PARALLEL=1
+      - OLLAMA_MAX_LOADED_MODELS=1
+    volumes:
+      - ollama_data:/root/.ollama
+    # runtime: nvidia 없음 → CPU 전용
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list > /dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 15s
+      retries: 24
+      start_period: 20s
+    logging:
+      driver: json-file
+      options: { max-size: "50m", max-file: "3" }
+
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: secmail_ollama_init
+    network_mode: host
+    restart: "no"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_HOST=http://localhost:11434
+    entrypoint: >
+      /bin/sh -c "
+        echo '=== Gemma4:e4b 설치 (CPU 모드) ===' &&
+        ollama pull gemma4:e4b &&
+        echo '=== 완료 ==='
+      "
+
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    container_name: secmail_backend
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL:       postgresql+asyncpg://${POSTGRES_USER:-secmail}:${POSTGRES_PASSWORD:-secmail_pass_2024}@localhost:5432/${POSTGRES_DB:-secmail}
+      GMAIL_USER:         ${GMAIL_USER:-}
+      GMAIL_APP_PASSWORD: ${GMAIL_APP_PASSWORD:-}
+      GMAIL_QUERY:        ${GMAIL_QUERY:-subject:security OR subject:alert OR subject:warning}
+      GMAIL_LABEL_IDS:    ${GMAIL_LABEL_IDS:-[]}
+      OLLAMA_URL:         http://localhost:11434
+      OLLAMA_MODEL:       ${OLLAMA_MODEL:-gemma4:e4b}
+      SMTP_HOST:          ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT:          ${SMTP_PORT:-587}
+      SMTP_USER:          ${SMTP_USER:-}
+      SMTP_PASSWORD:      ${SMTP_PASSWORD:-}
+      REPORT_RECIPIENTS:  ${REPORT_RECIPIENTS:-[]}
+      ABUSEIPDB_API_KEY:  ${ABUSEIPDB_API_KEY:-}
+      IPINFO_TOKEN:       ${IPINFO_TOKEN:-}
+      TZ:                 Asia/Seoul
+      PYTHONUNBUFFERED:   "1"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    logging:
+      driver: json-file
+      options: { max-size: "50m", max-file: "5" }
+
+  nginx:
+    image: nginx:alpine
+    container_name: secmail_nginx
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:61001/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  postgres_data:
+    driver: local
+  ollama_data:
+    driver: local

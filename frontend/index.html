@@ -793,8 +793,15 @@
   </div>
 
   <div class="status-bar" id="sidebar-status">
-    <div id="llm-status-dot" class="status-dot warning"></div>
-    <span id="llm-status-text">LLM 연결 중...</span>
+    <div style="margin-bottom:6px;">
+      <div id="llm-status-dot" class="status-dot warning" style="display:inline-block;"></div>
+      <span id="llm-status-text" style="font-size:11px;">Gemma4 연결 중...</span>
+    </div>
+    <div style="margin-bottom:4px;">
+      <div id="db-status-dot" class="status-dot warning" style="display:inline-block;"></div>
+      <span id="db-status-text" style="font-size:11px;">DB 연결 중...</span>
+    </div>
+    <div style="font-size:10px;color:var(--text-muted);margin-top:4px;" id="sys-info-text">포트: 61001</div>
   </div>
 </nav>
 
@@ -835,6 +842,6 @@
 <!-- Toast notifications -->
 <div id="toast"></div>
 
-<script src="/static/app.js"></script>
+<script src="/static/app.js" defer></script>
 </body>
 </html>
