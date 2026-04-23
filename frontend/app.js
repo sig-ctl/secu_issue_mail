@@ -2172,11 +2172,7 @@ function showCorrelationModal() {
       </ol>
     </div>
 
-    ${_corrStatus.running ? \`
-    <div style="padding:10px 14px;background:rgba(67,97,238,0.1);border:1px solid rgba(67,97,238,0.3);border-radius:8px;margin-bottom:14px;display:flex;align-items:center;gap:10px;">
-      <div class="spinner" style="width:16px;height:16px;border-width:2px;"></div>
-      <span style="color:var(--accent-cyan);font-weight:600;">상관분석이 진행 중입니다. 잠시 기다려주세요...</span>
-    </div>\` : ''}
+      ${_corrStatus.running ? '<div style="padding:10px 14px;background:rgba(67,97,238,0.1);border:1px solid rgba(67,97,238,0.3);border-radius:8px;margin-bottom:14px;display:flex;align-items:center;gap:10px;"><span style="color:var(--accent-cyan);font-weight:600;">⏳ 상관분석 진행 중...</span></div>' : ''}
 
     <div class="form-row">
       <div class="form-group">
